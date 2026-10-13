@@ -11,6 +11,7 @@ The model is pure — no Qt, SQLite, or catalog dependency.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Literal
@@ -257,12 +258,46 @@ class ScreenshotConfig:
     ``photos_per_row`` only applies when ``layout == "grid"``; older
     payloads that omit it fall back to 3, which is what
     the renderers assume when the attribute is absent.
+
+    The visual knobs (L15.9.3) normalise themselves silently in
+    ``__post_init__``: negative pixel counts clamp to 0, an
+    ``border_color`` that is not a 6-digit hex falls back to
+    ``"#CCCCCC"``, and an ``align`` outside ``left``/``center``/``right``
+    falls back to ``"left"``.  Nothing here raises, so a hand-edited or
+    older payload can never break loading.  Validation runs on
+    construction, so ``from_dict`` (and ``dataclasses.replace``) get it
+    for free.
     """
     enabled: bool = True
     max_width_px: int = 200
     max_height_px: int = 150
     layout: Literal["grid", "row"] = "row"
     photos_per_row: int = 3
+    border_width_px: int = 0
+    border_color: str = "#CCCCCC"
+    corner_radius_px: int = 0
+    spacing_px: int = 4
+    align: str = "left"
+
+    _HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+    _ALIGN_VALUES = ("left", "center", "right")
+
+    def __post_init__(self) -> None:
+        self.border_width_px = self._non_negative(self.border_width_px, 0)
+        self.corner_radius_px = self._non_negative(self.corner_radius_px, 0)
+        self.spacing_px = self._non_negative(self.spacing_px, 4)
+        if not self._HEX_COLOR_RE.match(str(self.border_color)):
+            self.border_color = "#CCCCCC"
+        if self.align not in self._ALIGN_VALUES:
+            self.align = "left"
+
+    @staticmethod
+    def _non_negative(value: Any, fallback: int) -> int:
+        """Coerce to an int >= 0; anything else → *fallback* (no raise)."""
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            return fallback
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -33,17 +33,21 @@ from bootleg_catalog.models.resolved_export import (
     ResolvedShowSection,
 )
 from bootleg_catalog.ui.dialogs.header_footer_dialog import HeaderFooterDialog
-from bootleg_catalog.ui.dialogs.layout_designer_dialog import LayoutDesignerDialog
+from bootleg_catalog.ui.dialogs.layout_designer_dialog import (
+    LayoutDesignerDialog,
+    PageSetupDialog,
+)
 from bootleg_catalog.ui.widgets.export_preview_widget import PreviewWidget
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QFont, QFontDatabase, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
     QFileDialog,
+    QFontComboBox,
     QGraphicsDropShadowEffect,
     QLabel,
     QPushButton,
@@ -63,6 +67,48 @@ def qt_app():
     if app is None:
         app = QApplication([])
     return app
+
+
+# Two TTFs every Windows install ships.  Qt's offscreen platform never
+# scans the system font directory, so its font database starts EMPTY
+# and QFontComboBox has nothing to list (L15.9.1).
+_FONT_FIXTURE_FILES = (
+    (
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "arial.ttf",
+        "Arial",
+    ),
+    (
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "cour.ttf",
+        "Courier New",
+    ),
+)
+
+
+@pytest.fixture
+def installed_fonts(qt_app):
+    """Yield two font families the PageSetup combos can really select.
+
+    Loads two system TTFs as application fonts — this works no matter
+    which test file created the QApplication first (setting
+    ``QT_QPA_FONTDIR`` later has no effect: the database is already
+    initialized empty) — and removes them again on teardown, leaving
+    the process-wide font database exactly as it was.
+    """
+    already = set(QFontDatabase.families())
+    loaded: list[int] = []
+    for path, family in _FONT_FIXTURE_FILES:
+        if family not in already and path.is_file():
+            font_id = QFontDatabase.addApplicationFont(str(path))
+            if font_id != -1:
+                loaded.append(font_id)
+    families = set(QFontDatabase.families())
+    for _, family in _FONT_FIXTURE_FILES:
+        assert family in families, f"{family} must load for this test"
+    try:
+        yield ("Arial", "Courier New")
+    finally:
+        for font_id in loaded:
+            QFontDatabase.removeApplicationFont(font_id)
 
 
 def _make_layout(**overrides) -> LayoutModel:
@@ -657,6 +703,37 @@ class TestPageSetupScreenshots:
         dlg._on_save()
         assert dlg.result_layout.screenshot_config.max_width_px == 420
 
+    def test_visual_controls_reflect_config(self, qt_app) -> None:
+        """L15.9.3: the new controls show the ScreenshotConfig's values."""
+        config = ScreenshotConfig(
+            spacing_px=12, border_width_px=3, border_color="#123456",
+            corner_radius_px=8, align="center",
+        )
+        dialog = PageSetupDialog(PageConfig(), screenshot_config=config)
+
+        spacing = dialog.findChild(QSpinBox, "shotSpacingSpin")
+        border_width = dialog.findChild(QSpinBox, "shotBorderWidthSpin")
+        border_colour = dialog.findChild(
+            QPushButton, "shotBorderColourButton"
+        )
+        corner_radius = dialog.findChild(QSpinBox, "shotCornerRadiusSpin")
+        align = dialog.findChild(QComboBox, "shotAlignCombo")
+        assert spacing.value() == 12
+        assert border_width.value() == 3
+        assert border_colour.text() == "#123456"
+        assert corner_radius.value() == 8
+        assert align.currentText() == "Center"
+
+    def test_accept_carries_new_spacing(self, qt_app) -> None:
+        """Accepting with a new spacing returns it on the result config."""
+        dialog = PageSetupDialog(PageConfig())
+        dialog.findChild(QSpinBox, "shotSpacingSpin").setValue(17)
+
+        dialog._on_accept()
+
+        assert dialog.result_screenshot_config is not None
+        assert dialog.result_screenshot_config.spacing_px == 17
+
 
 # ---------------------------------------------------------------------------
 # Inline formatting toolbar (L15.8.6a)
@@ -1009,3 +1086,52 @@ class TestLibraryLogoMode:
             if lbl.pixmap() is not None and not lbl.pixmap().isNull()
         ]
         assert pixmaps
+
+
+class TestPageSetupFonts:
+    """L15.9.1: PageSetupDialog offers the installed body/header fonts."""
+
+    def test_font_combos_show_configured_families(
+        self, qt_app, installed_fonts
+    ) -> None:
+        """Two QFontComboBox children, each on its PageConfig family."""
+        body_fam, header_fam = installed_fonts
+
+        dialog = PageSetupDialog(
+            PageConfig(body_font=body_fam, header_font=header_fam)
+        )
+
+        combos = dialog.findChildren(QFontComboBox)
+        assert len(combos) == 2
+        body = dialog.findChild(QFontComboBox, "bodyFontCombo")
+        header = dialog.findChild(QFontComboBox, "headerFontCombo")
+        assert body is not None
+        assert header is not None
+        assert body.currentFont().family() == body_fam
+        assert header.currentFont().family() == header_fam
+
+    def test_accept_carries_changed_body_font(
+        self, qt_app, installed_fonts
+    ) -> None:
+        """Accepting after changing the combo stores the new family name."""
+        original, replacement = installed_fonts
+
+        dialog = PageSetupDialog(PageConfig(body_font=original))
+        dialog._body_font_combo.setCurrentFont(QFont(replacement))
+
+        dialog._on_accept()
+
+        assert dialog.result_page_config is not None
+        assert dialog.result_page_config.body_font == replacement
+        # Stored as a plain family name, never a QFont.
+        assert isinstance(dialog.result_page_config.body_font, str)
+
+    def test_uninstalled_body_font_shows_warning(self, qt_app) -> None:
+        """A configured family missing here warns beneath its combo."""
+        dialog = PageSetupDialog(PageConfig(body_font="ThisFontIsNotInstalled"))
+
+        warning = dialog.findChild(QLabel, "bodyFontWarning")
+        assert warning is not None
+        assert not warning.isHidden()
+        assert '"ThisFontIsNotInstalled" is not installed here' in warning.text()
+        assert "will fall back to Helvetica" in warning.text()

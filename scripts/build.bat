@@ -1,4 +1,5 @@
 @echo off
+REM Meant to be run from the repository root (scripts\build.sh is the POSIX sibling).
 REM Build Bootleg Catalog Manager for Windows
 REM Output: dist\bootleg-catalog-manager\bootleg-catalog-manager.exe
 

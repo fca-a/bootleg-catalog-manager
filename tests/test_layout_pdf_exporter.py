@@ -782,6 +782,96 @@ class TestInlineScreenshotRendering:
         assert pdf._image_draws == []
 
 
+class TestScreenshotVisualConfig:
+    """L15.9.3: spacing/border from ScreenshotConfig reach the PDF.
+
+    Spy choice: the same call-through instance-spy pattern as
+    :class:`TestHighlightAndColourRendering` — a ``_LayoutPDF`` factory
+    patch recording the ``image``/``rect`` calls with their arguments.
+    """
+
+    def _screenshot_document(
+        self,
+        paths: list[str],
+        n: int = 2,
+        **config_overrides,
+    ) -> ResolvedExportDocument:
+        """A document whose recording body is a resolved [Screenshot:N]."""
+        from bootleg_catalog.core.field_resolver import FieldResolver
+        from bootleg_catalog.core.layout_text import parse_layout_lines
+
+        body = parse_layout_lines(f"[Screenshot:{n}]")
+        rec = _make_recording(screenshot_paths=list(paths))
+        resolver = FieldResolver()
+        resolved_lines = [resolver.resolve_line(line, rec)[0] for line in body]
+        recording = ResolvedRecording(recording=rec, lines=resolved_lines)
+        return _make_document(
+            recordings=[recording],
+            recording_body=body,
+            screenshot_config=ScreenshotConfig(**config_overrides),
+        )
+
+    def _export_with_spy(
+        self, doc: ResolvedExportDocument, out_path: Path, *method_names: str,
+    ) -> dict[str, list[tuple]]:
+        import bootleg_catalog.core.layout_pdf_exporter as exporter_mod
+
+        calls: dict[str, list[tuple]] = {name: [] for name in method_names}
+        real_cls = exporter_mod._LayoutPDF
+
+        def _factory(*args, **ctor_kwargs):
+            instance = real_cls(*args, **ctor_kwargs)
+            for name in method_names:
+                original = getattr(instance, name)
+
+                def spy(*m_args, _name=name, _original=original, **m_kwargs):
+                    calls[_name].append((m_args, m_kwargs))
+                    return _original(*m_args, **m_kwargs)
+
+                setattr(instance, name, spy)
+            return instance
+
+        with patch.object(exporter_mod, "_LayoutPDF", side_effect=_factory):
+            exporter_mod.export_layout_pdf(doc, out_path)
+        return calls
+
+    def test_spacing_px_separates_images(self, tmp_path: Path) -> None:
+        """spacing_px=10 puts the 2nd image at least one image+gap away.
+
+        Both PNGs are tall, so the height bound is binding and each
+        scaled width sits strictly below the cell width — the gap
+        between draw positions is then exactly the configured spacing.
+        """
+        paths = [
+            str(_make_small_png(tmp_path / f"shot{i}.png", size=(64, 160)))
+            for i in range(2)
+        ]
+        doc = self._screenshot_document(paths, n=2, spacing_px=10)
+        out_path = tmp_path / "spacing.pdf"
+
+        calls = self._export_with_spy(doc, out_path, "image")
+
+        draws = [kwargs for _, kwargs in calls["image"]]
+        assert len(draws) == 2
+        first, second = draws
+        gap_mm = 10 * 25.4 / 96.0
+        assert second["x"] >= first["x"] + first["w"] + gap_mm
+
+    def test_border_width_px_draws_stroke_rects(self, tmp_path: Path) -> None:
+        """border_width_px=2 strokes a rect behind each image."""
+        paths = [_make_small_png(tmp_path / f"shot{i}.png") for i in range(2)]
+        doc = self._screenshot_document(paths, n=2, border_width_px=2)
+        out_path = tmp_path / "bordered.pdf"
+
+        calls = self._export_with_spy(doc, out_path, "rect")
+
+        stroke_calls = [
+            kwargs for _, kwargs in calls["rect"]
+            if "D" in str(kwargs.get("style", ""))
+        ]
+        assert len(stroke_calls) >= 2
+
+
 class TestResolveTextSlot:
     def test_resolves_markers_and_plain_text(self) -> None:
         """{Field}/[Field] markers resolve; plain text passes through."""
@@ -972,3 +1062,57 @@ class TestPDFLogoSlots:
             return_value=tmp_path,
         ):
             assert resolve_logo_slot(LogoSlot(logo_file="missing.png")) is None
+
+
+class TestFontResolution:
+    """L15.9.1: PageConfig fonts resolve to TTF files, or fall back.
+
+    The resolver's fallback contract: Helvetica is the fpdf built-in
+    (never a TTF on disk) so it must return None rather than scan or
+    raise; an unresolvable family exports anyway, with a warning.
+    """
+
+    def test_helvetica_body_font_exports(self, tmp_path: Path) -> None:
+        """body_font="Helvetica" (the existing default) still exports.
+
+        Pins the built-in path against the new resolver: no scan, no
+        warning machinery in the way — exactly the pre-L15.9.1
+        behaviour.
+        """
+        doc = _make_document(page_config=PageConfig(body_font="Helvetica"))
+        out = tmp_path / "helvetica_body.pdf"
+
+        result = export_layout_pdf(doc, out)
+
+        assert result.exists()
+        assert result.stat().st_size > 0
+
+    def test_missing_body_font_warns_and_falls_back(
+        self, tmp_path: Path,
+    ) -> None:
+        """An uninstalled family exports via Helvetica, with a warning."""
+        import bootleg_catalog.core.layout_pdf_exporter as exporter_mod
+
+        doc = _make_document(
+            page_config=PageConfig(body_font="ThisFontDoesNotExist")
+        )
+        out = tmp_path / "missing_font_body.pdf"
+
+        with patch.object(exporter_mod, "get_logger") as mock_logger:
+            result = export_layout_pdf(doc, out)
+
+        assert result.exists()
+        warning = mock_logger.return_value.warning
+        assert warning.called, "expected a fallback warning on the logger"
+        # The message names the font the user asked for.
+        assert "ThisFontDoesNotExist" in warning.call_args[0][0]
+
+    def test_resolve_font_helvetica_returns_none(self) -> None:
+        """_resolve_font("Helvetica") is None — never an exception.
+
+        Helvetica is an fpdf built-in core font, not a TTF file on
+        disk, so there is nothing to resolve.
+        """
+        from bootleg_catalog.core.layout_pdf_exporter import _resolve_font
+
+        assert _resolve_font("Helvetica") is None

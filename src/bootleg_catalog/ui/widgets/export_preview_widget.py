@@ -32,6 +32,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QScrollArea,
+    QSizePolicy,
+    QSpacerItem,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -113,7 +115,6 @@ def _estimate_height_px(text: str, font: QFont, content_width_px: int) -> int:
 _SCREENSHOT_PLACEHOLDER_COLOR = "#9CA3AF"
 # Configs predating photos_per_row get the fixed three-column default.
 _SCREENSHOT_GRID_COLUMNS = 3
-_SCREENSHOT_SPACING_PX = 4
 
 
 def _split_screenshot_segments(line: ResolvedLine) -> list[tuple[str, object]]:
@@ -659,6 +660,8 @@ class PreviewWidget(QWidget):
                     self._flow_spacer(_RECORDING_GAP_PX)
                 self._flow_recording(resolved_rec, scale)
 
+        self._finish_page()
+
     def _flow_line(self, line: ResolvedLine, font: QFont | None) -> None:
         """Add a resolved line to the current page, breaking if needed.
 
@@ -715,11 +718,14 @@ class PreviewWidget(QWidget):
         grid_cols = getattr(config, "photos_per_row", _SCREENSHOT_GRID_COLUMNS)
         cols = grid_cols if config.layout == "grid" else len(cells)
         cols = max(1, min(cols, len(cells)))
+        # The configured gap (L15.9.3) is what the row layout uses, so
+        # the cells are sized around it too.
+        gap_px = config.spacing_px
         cell_w = max(
             1,
             min(
                 max_w,
-                (self._content_w - _SCREENSHOT_SPACING_PX * (cols - 1)) // cols,
+                (self._content_w - gap_px * (cols - 1)) // cols,
             ),
         )
 
@@ -752,12 +758,24 @@ class PreviewWidget(QWidget):
         cell_w: int,
         row_h: int,
     ) -> None:
-        """Add one row of pixmap/placeholder labels to the current page."""
+        """Add one row of pixmap/placeholder labels to the current page.
+
+        L15.9.3: ``spacing_px`` becomes the row layout's gap, a
+        ``border_width_px > 0`` wraps every cell in a QFrame whose
+        stylesheet draws the border (rounded when ``corner_radius_px >
+        0``), and ``align`` positions the row inside the page column by
+        moving the stretch to the opposite edge.  The radius is only
+        ever applied together with a border: QSS cannot clip a QLabel's
+        pixmap, so a borderless rounded frame would paint nothing.
+        """
+        config = self._screenshot_config
         row = QWidget()
         row.setObjectName("screenshotRow")
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.setSpacing(_SCREENSHOT_SPACING_PX)
+        row_layout.setSpacing(config.spacing_px)
+        if config.align != "left":
+            row_layout.addStretch()
         for pix in scaled:
             label = QLabel()
             if pix is not None and not pix.isNull():
@@ -773,9 +791,31 @@ class PreviewWidget(QWidget):
                     f" border: 1px dashed {_SCREENSHOT_PLACEHOLDER_COLOR};"
                 )
                 label.setFixedSize(cell_w, row_h)
-            row_layout.addWidget(label)
-        row_layout.addStretch()
+            if config.border_width_px > 0:
+                row_layout.addWidget(self._wrap_screenshot_cell(label, config))
+            else:
+                row_layout.addWidget(label)
+        if config.align != "right":
+            row_layout.addStretch()
         self._page.layout().addWidget(row)  # type: ignore[union-attr]
+
+    @staticmethod
+    def _wrap_screenshot_cell(label: QLabel, config: ScreenshotConfig) -> QFrame:
+        """Wrap *label* in a QFrame bordering it per the ScreenshotConfig."""
+        frame = QFrame()
+        frame.setObjectName("screenshotFrame")
+        inner = QVBoxLayout(frame)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(0)
+        inner.addWidget(label)
+        style = (
+            f"border: {config.border_width_px}px solid {config.border_color};"
+            " background-color: transparent;"
+        )
+        if config.corner_radius_px > 0:
+            style += f" border-radius: {config.corner_radius_px}px;"
+        frame.setStyleSheet(style)
+        return frame
 
     def _flow_text(self, text: str, font: QFont, *, color: str | None = None) -> None:
         """Add a plain label to the current page, breaking if needed."""
@@ -815,9 +855,30 @@ class PreviewWidget(QWidget):
             return
         # "— Page N —" marker in the middle of a rule, then a fresh page.
         self._pages_box.addWidget(self._make_page_break_marker(len(self._pages) + 1))
+        self._finish_page()
         self._page = self._new_page()
         self._pages.append(self._page)
         self._cursor = 0
+
+    def _finish_page(self) -> None:
+        """Pad out the completed page's leftover height.
+
+        Content stacks from the top of the page's content area; with
+        nothing to absorb the surplus, the layout hands the entire
+        remaining height to the content widgets themselves, so the
+        line label grows to the full content height — and any
+        background painted on it (the propagated desk colour behind a
+        highlighted run) stretches with it.  The spacer is
+        horizontally Fixed so it takes none of the labels' width and
+        keeps the text wrapping unchanged; vertically it is Expanding,
+        so every flowed item stays at the height Qt computed for its
+        own text.
+        """
+        layout = self._page.layout() if self._page is not None else None
+        if layout is not None:
+            layout.addSpacerItem(
+                QSpacerItem(0, 0, QSizePolicy.Fixed, QSizePolicy.Expanding)
+            )
 
     def _new_page(self) -> QFrame:
         """Create one white page frame at the current zoom size."""

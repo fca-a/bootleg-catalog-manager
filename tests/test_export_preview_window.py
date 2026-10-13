@@ -555,6 +555,42 @@ class TestInlineScreenshotToken:
         assert widths(100) == [100]
 
 
+class TestScreenshotVisualStyling:
+    """L15.9.3: spacing/border from ScreenshotConfig reach the preview."""
+
+    @staticmethod
+    def _render(qt_app, tmp_path, **config_overrides):
+        """Render one [Screenshot:2] document with two real PNGs."""
+        paths = [str(_make_png(tmp_path / f"s{i}.png")) for i in range(2)]
+        doc = _screenshot_doc(paths, n=2, **config_overrides)
+        widget = PreviewWidget()
+        widget._zoom_combo.setCurrentText("100%")
+        widget.set_document(doc)
+        return widget
+
+    def test_spacing_px_sets_row_gap(self, qt_app, tmp_path) -> None:
+        """spacing_px=10 → the row layout's gap between thumbnails is >= 10."""
+        widget = self._render(qt_app, tmp_path, spacing_px=10)
+
+        rows = widget.findChildren(QWidget, "screenshotRow")
+        assert len(rows) == 1
+        assert len(_pixmap_labels(rows[0])) == 2
+        assert rows[0].layout().spacing() >= 10
+
+    def test_border_width_wraps_labels_in_frames(self, qt_app, tmp_path) -> None:
+        """border_width_px=2 → each thumbnail sits in a bordered QFrame."""
+        widget = self._render(qt_app, tmp_path, border_width_px=2)
+
+        labels = _pixmap_labels(widget)
+        assert len(labels) == 2
+        for label in labels:
+            frame = label.parentWidget()
+            assert isinstance(frame, QFrame)
+            sheet = frame.styleSheet()
+            assert "border" in sheet
+            assert "2px" in sheet
+
+
 class TestColouredElements:
     """ElementStyle.color / .highlight_color render as spans (L15.8.6b)."""
 
@@ -591,6 +627,139 @@ class TestColouredElements:
         assert label.text() == "word"
         assert "style=" not in label.text()
         assert "span" not in label.text()
+
+
+class TestHighlightBackgroundHeight:
+    """A highlighted run's background wraps its own line, not the page.
+
+    Regression guard: a one-line document whose only body line carries a
+    highlight (``[mark:...]`` or ``==...==``) must render a background
+    that hugs that single line.  The observed bug drew the background
+    across most of the page instead.
+    """
+
+    @staticmethod
+    def _highlight_doc(markup: str) -> ResolvedExportDocument:
+        """A document with one show section and a single body line.
+
+        *markup* is parsed and resolved through the real pipeline, so
+        the preview sees exactly what the resolver produces.
+        """
+        from bootleg_catalog.core.field_resolver import FieldResolver
+        from bootleg_catalog.core.layout_text import parse_layout_lines
+
+        layout = _make_layout()
+        body = parse_layout_lines(markup)
+        layout.recording_body = body
+
+        rec = _make_recording()
+        resolver = FieldResolver()
+        resolved_lines = [resolver.resolve_line(line, rec)[0] for line in body]
+        section = ResolvedShowSection(
+            show_name="Show",
+            header_lines=[],
+            recordings=[ResolvedRecording(recording=rec, lines=resolved_lines)],
+        )
+        return ResolvedExportDocument(
+            layout=layout, show_sections=[section], separator=None,
+        )
+
+    @staticmethod
+    def _rendered_page(markup: str, qt_app) -> tuple[QWidget, QFrame]:
+        """Preview *markup* at 100% zoom; return (preview, page frame).
+
+        The PreviewWidget itself is returned too — the page is its
+        descendant and would die with it.
+        """
+        widget = PreviewWidget()
+        # Qt only lays out visible widgets, so show first (offscreen);
+        # the real app embeds the preview in a shown window.
+        widget.show()
+        widget.resize(900, 900)
+        widget.findChild(QComboBox, "zoomComboBox").setCurrentText("100%")
+        widget.set_document(TestHighlightBackgroundHeight._highlight_doc(markup))
+        qt_app.processEvents()
+        page = widget.findChild(QFrame, "previewPage")
+        assert page is not None
+        return widget, page
+
+    @staticmethod
+    def _carries(widget: QWidget, hex_colour: str) -> bool:
+        """True when *widget*'s stylesheet or palette carries *hex_colour*."""
+        from PySide6.QtGui import QPalette
+
+        blob = widget.styleSheet().lower()
+        palette = widget.palette()
+        for role in (
+            QPalette.ColorRole.Window,
+            QPalette.ColorRole.Base,
+            QPalette.ColorRole.Button,
+            QPalette.ColorRole.AlternateBase,
+        ):
+            blob += palette.color(role).name()
+        return hex_colour.lower() in blob
+
+    @staticmethod
+    def _page_dump(page: QFrame) -> str:
+        """Every widget inside *page* with geometry, stylesheet, palette."""
+        from PySide6.QtGui import QPalette
+
+        return "\n".join(
+            f"  {type(w).__name__} name={w.objectName()!r}"
+            f" geo={w.geometry().getRect()}"
+            f" sheet={w.styleSheet()[:60]!r}"
+            f" palWin={w.palette().color(QPalette.ColorRole.Window).name()!r}"
+            f" palBase={w.palette().color(QPalette.ColorRole.Base).name()!r}"
+            f" text={(w.text() if isinstance(w, QLabel) else '')[:60]!r}"
+            for w in [page, *page.findChildren(QWidget)]
+        )
+
+    def test_highlight_background_height_matches_line(self, qt_app) -> None:
+        """[mark:#F3F4F6]: the grey background stays line-high."""
+        _widget, page = self._rendered_page(
+            "[mark=#F3F4F6]short text[/mark]", qt_app
+        )
+        matches = [
+            w
+            for w in [page, *page.findChildren(QWidget)]
+            if isinstance(w, (QFrame, QLabel)) and self._carries(w, "#F3F4F6")
+        ]
+        assert matches, (
+            "no QFrame/QLabel inside the page carries #F3F4F6; page has:\n"
+            + self._page_dump(page)
+        )
+        background = matches[0]
+        assert background.height() < 30, (
+            f"highlight background widget {type(background).__name__}"
+            f" name={background.objectName()!r} is {background.height()}px"
+            f" tall; a single line must stay under 30px\n"
+            + self._page_dump(page)
+        )
+
+    def test_equals_highlight_background_height_matches_line(self, qt_app) -> None:
+        """==text== (default yellow): the background stays line-high too.
+
+        The widget carrying the default-yellow background is located by
+        its rich-text span — unlike the ``[mark]`` colour, the span is
+        where ``==...==`` renders.
+        """
+        _widget, page = self._rendered_page("==short text==", qt_app)
+        matches = [
+            w
+            for w in page.findChildren(QLabel)
+            if "background-color:#FFFF00" in w.text()
+        ]
+        assert matches, (
+            "no QLabel inside the page carries the #FFFF00 highlight span;"
+            " page has:\n" + self._page_dump(page)
+        )
+        background = matches[0]
+        assert background.height() < 30, (
+            f"highlight background widget {type(background).__name__}"
+            f" name={background.objectName()!r} is {background.height()}px"
+            f" tall; a single line must stay under 30px\n"
+            + self._page_dump(page)
+        )
 
 
 class TestPreviewPage:

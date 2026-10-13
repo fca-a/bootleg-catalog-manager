@@ -9,13 +9,21 @@ from unittest.mock import patch
 
 import pytest
 
+from bootleg_catalog.core.settings_service import AppSettings
 from bootleg_catalog.models.export_recording import ExportRecording
 from bootleg_catalog.ui.dialogs.screenshot_manager_dialog import (
+    GenerateScreenshotsDialog,
     ScreenshotManagerDialog,
 )
 
-from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtWidgets import QApplication, QLabel, QPushButton
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QThread, Signal
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QLabel,
+    QPushButton,
+    QSpinBox,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -55,9 +63,11 @@ def _drain_deferred_deletes(qt_app):
 def _make_recording(
     screenshots: list[str] | None = None,
     manual: set[str] | None = None,
+    duration: float | None = None,
 ) -> ExportRecording:
     return ExportRecording(
         source_path="C:/media/concert.mkv",
+        duration=duration,
         screenshot_paths=list(screenshots or []),
         manual_paths=set(manual or []),
     )
@@ -81,6 +91,63 @@ def _row_button(
     dialog: ScreenshotManagerDialog, row: int, object_name: str,
 ) -> QPushButton:
     return dialog._row_widgets[row].findChild(QPushButton, object_name)
+
+
+# ---------------------------------------------------------------------------
+# Test doubles for the generation flow (L15.9.2)
+# ---------------------------------------------------------------------------
+
+class _SyncQThread(QThread):
+    """QThread double that runs its worker synchronously.
+
+    Same double as test_probe_worker: ``start`` emits ``started``
+    directly, so a worker that stays in the main thread runs in place;
+    ``isRunning`` reports idle so close/lock guards treat it as done.
+    """
+
+    def start(self, *args, **kwargs) -> None:  # noqa: N802 (Qt API)
+        self.start_called = True
+        self.started.emit()
+
+    def isRunning(self) -> bool:  # noqa: N802 (Qt API)
+        return False
+
+
+class _RecordingScreenshotWorker(QObject):
+    """ScreenshotWorker double: records the call, never emits a result."""
+
+    progress = Signal(int, int)
+    finished = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, video_path, plan, ffmpeg_path, overwrite=False) -> None:
+        super().__init__()
+        self.video_path = video_path
+        self.plan = plan
+        self.ffmpeg_path = ffmpeg_path
+        self.overwrite = overwrite
+        self.ran = False
+
+    def moveToThread(self, thread) -> None:  # noqa: N802 (Qt API)
+        # Deliberately a no-op: staying in the main thread keeps the
+        # started -> run dispatch direct (synchronous) in tests.
+        self.moved_thread = thread
+
+    def run(self) -> None:
+        self.ran = True
+
+
+class _AcceptingGenerateDialog(GenerateScreenshotsDialog):
+    """Modal double: set the count to 3 and accept immediately.
+
+    Only ``exec`` is overridden, so the plan the manager builds comes
+    from the real widgets (Auto stays the default radio).
+    """
+
+    def exec(self) -> QDialog.DialogCode:  # noqa: N802 (Qt API)
+        self.findChild(QSpinBox, "frameCountSpin").setValue(3)
+        self.accept()
+        return self.result()
 
 
 # ---------------------------------------------------------------------------
@@ -582,3 +649,99 @@ class TestTwoPartSections:
         )
         rejected.reject()
         assert rejected.result_screenshot_split is None
+
+
+# ---------------------------------------------------------------------------
+# Generation flow (L15.9.2)
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateScreenshotsFlow:
+    """FFmpeg generation runs on a worker thread from the manager dialog."""
+
+    def test_generate_screenshots_button_exists(self, qt_app) -> None:
+        """The manager offers the generation entry point."""
+        dialog = ScreenshotManagerDialog(_make_recording())
+
+        button = dialog.findChild(QPushButton, "generateScreenshotsButton")
+
+        assert button is not None
+        assert button.text() == "Generate Screenshots\u2026"
+
+    def test_accept_modal_starts_worker_with_three_timestamps(
+        self, qt_app,
+    ) -> None:
+        """Count=3 in Auto mode starts a worker with a 3-point plan."""
+        dialog = ScreenshotManagerDialog(_make_recording(duration=3600.0))
+
+        with patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "GenerateScreenshotsDialog",
+            _AcceptingGenerateDialog,
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "load_settings",
+            return_value=AppSettings(ffmpeg_path="C:/tools/ffmpeg.exe"),
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "ScreenshotWorker",
+            _RecordingScreenshotWorker,
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog.QThread",
+            _SyncQThread,
+        ):
+            dialog.findChild(
+                QPushButton, "generateScreenshotsButton",
+            ).click()
+
+        assert isinstance(dialog._screenshot_thread, _SyncQThread)
+        assert dialog._screenshot_thread.start_called
+        worker = dialog._screenshot_worker
+        assert worker.ran is True
+        assert worker.video_path == "C:/media/concert.mkv"
+        assert worker.ffmpeg_path == "C:/tools/ffmpeg.exe"
+        assert len(worker.plan.timestamps) == 3
+
+    def test_finished_appends_generated_paths_only(self, qt_app) -> None:
+        """finished(paths) adds Auto rows; manual_paths stays untouched."""
+        rec = _make_recording(
+            screenshots=["C:/shots/abertura.jpg"],
+            manual={"C:/shots/abertura.jpg"},
+            duration=3600.0,
+        )
+        dialog = ScreenshotManagerDialog(rec)
+        generated = [
+            "C:/media/concert.screenshot.01.jpg",
+            "C:/media/concert.screenshot.02.jpg",
+        ]
+
+        with patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "GenerateScreenshotsDialog",
+            _AcceptingGenerateDialog,
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "load_settings",
+            return_value=AppSettings(ffmpeg_path=""),
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "ScreenshotWorker",
+            _RecordingScreenshotWorker,
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog.QThread",
+            _SyncQThread,
+        ):
+            dialog.findChild(
+                QPushButton, "generateScreenshotsButton",
+            ).click()
+            dialog._screenshot_worker.finished.emit(generated)
+            dialog.accept()
+
+        assert dialog.result_screenshot_paths == [
+            "C:/shots/abertura.jpg",
+            *generated,
+        ]
+        assert dialog.result_manual_paths == {"C:/shots/abertura.jpg"}
+        # Status cleared and the buttons unlocked again.
+        assert dialog._status_label.isHidden()
+        assert dialog._buttons.isEnabled()

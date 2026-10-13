@@ -12,12 +12,13 @@ from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QTextCursor
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QTextCursor
 from PySide6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFontComboBox,
     QGraphicsDropShadowEffect,
     QFrame,
     QGridLayout,
@@ -879,13 +880,20 @@ class PageSetupDialog(QDialog):
     """Modal editor for a layout's :class:`PageConfig` and
     :class:`ScreenshotConfig`.
 
-    Edits the page size, orientation, per-side margins, and the
-    screenshot sizing used by inline ``[Screenshot:N]`` blocks.  On
-    accept, :attr:`result_page_config` is a NEW :class:`PageConfig` with
-    the edited fields and width/height recalculated from page size +
-    orientation, and :attr:`result_screenshot_config` is a NEW
-    :class:`ScreenshotConfig`; all other fields are preserved.  Both are
-    ``None`` until the dialog is accepted.
+    Edits the page size, orientation, per-side margins, the body and
+    header font families (chosen from the fonts installed on this
+    machine), and the screenshot sizing used by inline
+    ``[Screenshot:N]`` blocks.  On accept, :attr:`result_page_config`
+    is a NEW :class:`PageConfig` with the edited fields and
+    width/height recalculated from page size + orientation, and
+    :attr:`result_screenshot_config` is a NEW
+    :class:`ScreenshotConfig`; all other fields are preserved.  Both
+    are ``None`` until the dialog is accepted.
+
+    The font combos hold a family name (``str``), never a ``QFont``.
+    A configured family that is not installed here is shown with a
+    warning beneath the combo; the exporter falls back to Helvetica
+    for it at export time.
     """
 
     def __init__(
@@ -951,6 +959,65 @@ class PageSetupDialog(QDialog):
         reset_btn.clicked.connect(self._on_reset_margins)
         layout.addWidget(reset_btn)
 
+        # --- Fonts ---
+        # QFontComboBox lists the fonts installed on this machine (no
+        # filter — it already shows scalable fonts only).  What is
+        # stored on accept is the family name (a plain str), never a
+        # QFont.  setCurrentFont() does not need the family to be
+        # installed: when it is not, the combo stays on its default
+        # and the warning label beneath it says so.
+        # QFontDatabase is a static-style class in Qt ≥ 6.8; the
+        # instance constructor it replaced is deprecated.
+        self._installed_fonts = {
+            name.lower() for name in QFontDatabase.families()
+        }
+        fonts_box = QGroupBox("Fonts")
+        fonts_layout = QGridLayout(fonts_box)
+
+        fonts_layout.addWidget(QLabel("Body font:"), 0, 0)
+        self._body_font_combo = QFontComboBox(self)
+        self._body_font_combo.setObjectName("bodyFontCombo")
+        self._body_font_combo.setCurrentFont(QFont(page_config.body_font))
+        fonts_layout.addWidget(self._body_font_combo, 0, 1)
+        self._body_font_warning = QLabel("", self)
+        self._body_font_warning.setObjectName("bodyFontWarning")
+        self._body_font_warning.setWordWrap(True)
+        self._body_font_warning.setStyleSheet("color: #B45309; font-size: 10px;")
+        fonts_layout.addWidget(self._body_font_warning, 1, 0, 1, 2)
+
+        fonts_layout.addWidget(QLabel("Header font:"), 2, 0)
+        self._header_font_combo = QFontComboBox(self)
+        self._header_font_combo.setObjectName("headerFontCombo")
+        self._header_font_combo.setCurrentFont(QFont(page_config.header_font))
+        fonts_layout.addWidget(self._header_font_combo, 2, 1)
+        self._header_font_warning = QLabel("", self)
+        self._header_font_warning.setObjectName("headerFontWarning")
+        self._header_font_warning.setWordWrap(True)
+        self._header_font_warning.setStyleSheet("color: #B45309; font-size: 10px;")
+        fonts_layout.addWidget(self._header_font_warning, 3, 0, 1, 2)
+
+        # Warning state reflects the CONFIGURED family (what the
+        # dialog loaded), not the combo's displayed selection.
+        self._update_font_warning(
+            self._body_font_warning, page_config.body_font
+        )
+        self._update_font_warning(
+            self._header_font_warning, page_config.header_font
+        )
+        # The combos only offer installed fonts, so any user selection
+        # clears a warning left over from the loaded configuration.
+        self._body_font_combo.currentFontChanged.connect(
+            lambda font: self._update_font_warning(
+                self._body_font_warning, font.family()
+            )
+        )
+        self._header_font_combo.currentFontChanged.connect(
+            lambda font: self._update_font_warning(
+                self._header_font_warning, font.family()
+            )
+        )
+        layout.addWidget(fonts_box)
+
         # --- Screenshots ---
         # Sizing for inline [Screenshot:N] blocks, shared by the preview
         # and the PDF exporter.
@@ -991,6 +1058,49 @@ class PageSetupDialog(QDialog):
         self._shot_per_row_spin.setRange(1, 6)
         self._shot_per_row_spin.setValue(shots.photos_per_row)
         shots_layout.addWidget(self._shot_per_row_spin, 3, 1)
+
+        # Visual knobs (L15.9.3): gap, border, corner radius, alignment.
+        shots_layout.addWidget(QLabel("Spacing (px):"), 4, 0)
+        self._shot_spacing_spin = QSpinBox(self)
+        self._shot_spacing_spin.setObjectName("shotSpacingSpin")
+        self._shot_spacing_spin.setRange(0, 40)
+        self._shot_spacing_spin.setSingleStep(1)
+        self._shot_spacing_spin.setValue(shots.spacing_px)
+        shots_layout.addWidget(self._shot_spacing_spin, 4, 1)
+
+        shots_layout.addWidget(QLabel("Border width (px):"), 5, 0)
+        self._shot_border_width_spin = QSpinBox(self)
+        self._shot_border_width_spin.setObjectName("shotBorderWidthSpin")
+        self._shot_border_width_spin.setRange(0, 10)
+        self._shot_border_width_spin.setSingleStep(1)
+        self._shot_border_width_spin.setValue(shots.border_width_px)
+        shots_layout.addWidget(self._shot_border_width_spin, 5, 1)
+
+        self._shot_border_color = shots.border_color
+        shots_layout.addWidget(QLabel("Border colour:"), 6, 0)
+        self._shot_border_colour_button = QPushButton(self)
+        self._shot_border_colour_button.setObjectName("shotBorderColourButton")
+        self._update_shot_border_swatch()
+        self._shot_border_colour_button.clicked.connect(
+            self._on_shot_border_colour_clicked
+        )
+        shots_layout.addWidget(self._shot_border_colour_button, 6, 1)
+
+        shots_layout.addWidget(QLabel("Corner radius (px):"), 7, 0)
+        self._shot_corner_radius_spin = QSpinBox(self)
+        self._shot_corner_radius_spin.setObjectName("shotCornerRadiusSpin")
+        self._shot_corner_radius_spin.setRange(0, 40)
+        self._shot_corner_radius_spin.setSingleStep(1)
+        self._shot_corner_radius_spin.setValue(shots.corner_radius_px)
+        shots_layout.addWidget(self._shot_corner_radius_spin, 7, 1)
+
+        shots_layout.addWidget(QLabel("Alignment:"), 8, 0)
+        self._shot_align_combo = QComboBox(self)
+        self._shot_align_combo.setObjectName("shotAlignCombo")
+        self._shot_align_combo.addItems(["Left", "Center", "Right"])
+        self._shot_align_combo.setCurrentText(shots.align.capitalize())
+        shots_layout.addWidget(self._shot_align_combo, 8, 1)
+
         # Only meaningful for a grid; hidden while "row" is selected.
         self._on_shot_layout_changed(shots.layout)
         layout.addWidget(shots_box)
@@ -1023,6 +1133,40 @@ class PageSetupDialog(QDialog):
         self._shot_per_row_label.setVisible(is_grid)
         self._shot_per_row_spin.setVisible(is_grid)
 
+    def _update_shot_border_swatch(self) -> None:
+        """Show the border colour as the button's background swatch."""
+        self._shot_border_colour_button.setText(self._shot_border_color)
+        self._shot_border_colour_button.setStyleSheet(
+            f"background-color: {self._shot_border_color};"
+        )
+
+    def _on_shot_border_colour_clicked(self) -> None:
+        """Pick the screenshot border colour with the colour dialog."""
+        colour = QColorDialog.getColor(
+            QColor(self._shot_border_color), self, "Border colour"
+        )
+        if not colour.isValid():
+            return
+        # QColor.name() already returns the lowercase "#rrggbb" form.
+        self._shot_border_color = colour.name()
+        self._update_shot_border_swatch()
+
+    def _update_font_warning(self, label: QLabel, family: str) -> None:
+        """Show *label* beneath a font combo only for a missing family.
+
+        A family counts as missing when this machine does not have it.
+        "Helvetica" is excluded on purpose: it is the fpdf built-in and
+        the fallback family itself, so it is never at risk (a warning
+        claiming Helvetica falls back to Helvetica would be noise).
+        """
+        missing = bool(family) and family.lower() != "helvetica" \
+            and family.lower() not in self._installed_fonts
+        label.setText(
+            f'"{family}" is not installed here \u2014 '
+            "will fall back to Helvetica."
+        )
+        label.setVisible(missing)
+
     def _on_reset_margins(self) -> None:
         """Set all four margin spin boxes back to the uniform margin."""
         for spin in self._margin_spins.values():
@@ -1047,6 +1191,9 @@ class PageSetupDialog(QDialog):
             margin_right_mm=self._margin_spins["right"].value(),
             margin_bottom_mm=self._margin_spins["bottom"].value(),
             margin_left_mm=self._margin_spins["left"].value(),
+            # Family names (str) as displayed by the combos.
+            body_font=self._body_font_combo.currentFont().family(),
+            header_font=self._header_font_combo.currentFont().family(),
         )
         self._result_screenshot_config = replace(
             self._initial_screenshots,
@@ -1054,5 +1201,10 @@ class PageSetupDialog(QDialog):
             max_height_px=self._shot_height_spin.value(),
             layout=self._shot_layout_combo.currentText(),
             photos_per_row=self._shot_per_row_spin.value(),
+            spacing_px=self._shot_spacing_spin.value(),
+            border_width_px=self._shot_border_width_spin.value(),
+            border_color=self._shot_border_color,
+            corner_radius_px=self._shot_corner_radius_spin.value(),
+            align=self._shot_align_combo.currentText().lower(),
         )
         self.accept()

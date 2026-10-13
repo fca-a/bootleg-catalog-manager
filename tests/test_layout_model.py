@@ -264,6 +264,16 @@ class TestPageConfig:
             restored.margin_left_mm,
         ) == (10.0, 12.5, 14.0, 16.5)
 
+    def test_fonts_round_trip_through_dict(self) -> None:
+        """body_font/header_font survive to_dict → from_dict unchanged."""
+        pc = PageConfig(
+            body_font="Comic Sans MS",
+            header_font="Nimbus Roman No9 L",
+        )
+        restored = PageConfig.from_dict(pc.to_dict())
+        assert restored.body_font == "Comic Sans MS"
+        assert restored.header_font == "Nimbus Roman No9 L"
+
 
 # ---------------------------------------------------------------------------
 # ScreenshotConfig
@@ -288,6 +298,35 @@ class TestScreenshotConfig:
         assert sc.max_width_px == 300
         assert sc.layout == "grid"
         assert sc.enabled is True  # default
+
+    def test_visual_knobs_roundtrip_and_normalise(self) -> None:
+        """L15.9.3: all new fields round-trip; invalid values fall back."""
+        sc = ScreenshotConfig(
+            border_width_px=2,
+            border_color="#1234AB",
+            corner_radius_px=6,
+            spacing_px=10,
+            align="center",
+        )
+        d = sc.to_dict()
+        assert d["border_width_px"] == 2
+        assert d["border_color"] == "#1234AB"
+        assert d["corner_radius_px"] == 6
+        assert d["spacing_px"] == 10
+        assert d["align"] == "center"
+        assert ScreenshotConfig.from_dict(d) == sc
+        # An invalid colour and an invalid alignment fall back silently.
+        bad = ScreenshotConfig.from_dict(
+            {"border_color": "oops", "align": "diagonal"}
+        )
+        assert bad.border_color == "#CCCCCC"
+        assert bad.align == "left"
+        # A payload predating the new keys loads with the defaults.
+        legacy = ScreenshotConfig.from_dict({"max_width_px": 300})
+        assert legacy.border_width_px == 0
+        assert legacy.corner_radius_px == 0
+        assert legacy.spacing_px == 4
+        assert legacy.align == "left"
 
 
 # ---------------------------------------------------------------------------

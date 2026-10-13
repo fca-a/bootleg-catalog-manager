@@ -16,11 +16,20 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
 from fpdf import FPDF
+
+try:
+    # Optional accelerator: reads a font's real family name from its
+    # name table.  Never a hard dependency — the exporter falls back to
+    # a filename heuristic when it is absent.
+    from fontTools.ttLib import TTFont as _TTFont
+except ImportError:  # pragma: no cover - depends on the environment
+    _TTFont = None
 
 from bootleg_catalog.core.field_resolver import FieldResolver, ResolvedLine
 from bootleg_catalog.core.layout_service import (
@@ -38,6 +47,7 @@ from bootleg_catalog.models.layout_model import (
     TextSlot,
 )
 from bootleg_catalog.models.resolved_export import ResolvedExportDocument
+from bootleg_catalog.utils.logging import get_logger
 from bootleg_catalog.utils.paths import app_data_dir
 
 
@@ -180,7 +190,16 @@ class _LayoutPDF(FPDF):
     - ``_header_last_texts`` / ``_footer_last_texts`` — the resolved
       ``(left, center, right)`` texts most recently painted, for
       exact-text introspection in tests.
+
+    ``header_font`` / ``body_font`` are the families
+    :func:`export_layout_pdf` resolved and registered for this document.
+    The class-level defaults keep direct construction (and any
+    ``header()``/``footer()`` call during ``__init__``) on the fpdf
+    built-in until they are assigned.
     """
+
+    body_font = "Helvetica"
+    header_font = "Helvetica"
 
     def __init__(
         self,
@@ -302,7 +321,9 @@ class _LayoutPDF(FPDF):
                 self._draw_logo_slot(slot, align=align, y_center_mm=y_center_mm)
                 continue
             line_h_mm = slot.font_size * 0.352778  # pt → mm
-            self.set_font("Helvetica", "B" if slot.bold else "", slot.font_size)
+            # Only the family name changes (resolved header font);
+            # the bold modifier logic stays as-is.
+            self.set_font(self.header_font, "B" if slot.bold else "", slot.font_size)
             self.set_xy(self._margin_left_mm, y_center_mm - line_h_mm / 2)
             self.cell(usable_w, line_h_mm, slot.text, align=align)
         self.set_xy(saved_x, saved_y)
@@ -504,12 +525,18 @@ def _hex_to_rgb(value) -> tuple[int, int, int] | None:
 def _apply_style(pdf, style, page_config) -> None:
     """Apply an ElementStyle to the PDF context.
 
-    Falls back to *page_config* defaults for font family and size.  The
-    foreground colour is set from ``style.color`` when it is a valid
-    "#RRGGBB" and reset to black otherwise — the reset is
-    what keeps an uncoloured run from inheriting the previous one.
+    The font family is the body font
+    :func:`export_layout_pdf` resolved and registered on *pdf*
+    (``PageConfig.body_font`` when it could be embedded, Helvetica
+    otherwise); *page_config* only covers direct calls with a bare
+    FPDF.  The default size is 10 pt.  The foreground colour is set
+    from ``style.color`` when it is a valid "#RRGGBB" and reset to
+    black otherwise — the reset is what keeps an uncoloured run from
+    inheriting the previous one.
     """
-    family = getattr(page_config, "body_font", "Helvetica")
+    family = getattr(pdf, "body_font", None) or getattr(
+        page_config, "body_font", "Helvetica"
+    )
     size = 10
 
     if style is not None:
@@ -742,8 +769,44 @@ def _draw_element_with_style(
 
 
 _PX_TO_MM = 0.264583  # px -> mm at 96 DPI
-_PDF_SHOT_SPACING_MM = 2.0
 _PDF_SHOT_GRID_COLUMNS = 3  # ScreenshotConfig carries no photos_per_row
+
+
+def _shot_spacing_mm(screenshot_config) -> float:
+    """Configured inter-image gap in mm (L15.9.3)."""
+    return screenshot_config.spacing_px * 25.4 / 96.0
+
+
+def _shot_block_x(
+    screenshot_config, margin_left: float, usable_w: float, block_w: float,
+) -> float:
+    """Left edge of a screenshot block per the configured alignment."""
+    align = getattr(screenshot_config, "align", "left")
+    if align == "center":
+        return margin_left + (usable_w - block_w) / 2.0
+    if align == "right":
+        return margin_left + usable_w - block_w
+    return margin_left
+
+
+def _draw_shot_border(
+    pdf, screenshot_config, x: float, y: float, img_w: float, img_h: float,
+) -> None:
+    """Stroke a rectangle behind one image when a border is configured.
+
+    fpdf2 cannot draw rounded rectangles, so ``corner_radius_px`` is
+    ignored here — the PDF always draws a square rect.
+    """
+    border_mm = screenshot_config.border_width_px * 25.4 / 96.0
+    if border_mm <= 0:
+        return
+    rgb = _hex_to_rgb(screenshot_config.border_color) or (204, 204, 204)
+    pdf.set_draw_color(*rgb)
+    pdf.set_line_width(border_mm)
+    pdf.rect(x, y, img_w, img_h, style="D")
+    # Leave the default draw state for anything that follows.
+    pdf.set_draw_color(0, 0, 0)
+    pdf.set_line_width(0.2)
 
 
 def _render_screenshot_block(
@@ -763,6 +826,12 @@ def _render_screenshot_block(
     exists (missing ones are silently skipped, with no placeholder
     text); zero paths skip the block entirely without advancing the
     cursor.  The cursor is restored to the left margin after the block.
+
+    L15.9.3: the gap between images comes from ``spacing_px``, a
+    ``border_width_px > 0`` strokes a rectangle behind every image, and
+    ``align`` shifts the whole block within the content column.  fpdf2
+    cannot draw rounded rectangles, so ``corner_radius_px`` falls back
+    to a square rect here.
     """
     if recording is None or screenshot_config is None:
         return
@@ -778,6 +847,7 @@ def _render_screenshot_block(
 
     max_w_mm = max(1.0, screenshot_config.max_width_px * _PX_TO_MM)
     max_h_mm = max(1.0, screenshot_config.max_height_px * _PX_TO_MM)
+    spacing_mm = _shot_spacing_mm(screenshot_config)
     cols = (
         _PDF_SHOT_GRID_COLUMNS
         if screenshot_config.layout == "grid"
@@ -786,7 +856,7 @@ def _render_screenshot_block(
     cols = max(1, min(cols, len(existing)))
     cell_w = min(
         max_w_mm,
-        (usable_w - _PDF_SHOT_SPACING_MM * (cols - 1)) / cols,
+        (usable_w - spacing_mm * (cols - 1)) / cols,
     )
 
     margin_top, margin_right, margin_bottom, margin_left = (
@@ -812,18 +882,178 @@ def _render_screenshot_block(
             continue
 
         row_h = max(sh for _, _, sh in sizes)
-        if pdf.get_y() + row_h + 4 > bottom_limit:
+        if pdf.get_y() + row_h + spacing_mm > bottom_limit:
             pdf.add_page()
         y = pdf.get_y()
-        for col, (path, sw, _sh) in enumerate(sizes):
-            x = margin_left + col * (cell_w + _PDF_SHOT_SPACING_MM)
+        # The row occupies its full cell width for alignment purposes.
+        block_w = len(sizes) * cell_w + (len(sizes) - 1) * spacing_mm
+        origin_x = _shot_block_x(screenshot_config, margin_left, usable_w, block_w)
+        for col, (path, sw, sh) in enumerate(sizes):
+            x = origin_x + col * (cell_w + spacing_mm)
+            _draw_shot_border(pdf, screenshot_config, x, y, sw, sh)
             pdf.image(path, x=x, y=y, w=sw)
-        final_y = y + row_h + 4
+        final_y = y + row_h + spacing_mm
         pdf.set_y(final_y)
 
     # Restore the cursor to the left margin below the block so any text
     # that follows starts where a normal line would.
     pdf.set_xy(margin_left, final_y if final_y > saved_y else saved_y)
+
+
+# ---------------------------------------------------------------------------
+# Font resolution
+# ---------------------------------------------------------------------------
+
+# family name → (ttf path, family) or None.  Resolved AND unresolved
+# lookups are cached so repeated exports in one session do not re-scan
+# the font directories.
+_FONT_CACHE: dict[str, tuple[Path, str] | None] = {}
+
+
+def _font_search_dirs() -> tuple[tuple[Path, bool], ...]:
+    """(directory, recursive) pairs scanned for ``*.ttf`` on this OS.
+
+    Windows keeps its fonts flat in ``%WINDIR%\\Fonts``; macOS splits
+    them between ``/Library/Fonts`` (admin-installed) and
+    ``/System/Library/Fonts`` (system), both walked recursively to
+    catch subdirectories; Linux distributions install under
+    ``/usr/share/fonts`` in per-package trees, also recursive.
+    """
+    if sys.platform == "win32":
+        windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
+        return ((windir / "Fonts", False),)
+    if sys.platform == "darwin":
+        return (
+            (Path("/Library/Fonts"), True),
+            (Path("/System/Library/Fonts"), True),
+        )
+    return ((Path("/usr/share/fonts"), True),)
+
+
+def _read_tt_names(path: Path) -> tuple[str | None, str | None]:
+    """``(family, subfamily)`` from *path*'s name table via fontTools.
+
+    Family prefers name ID 16 (typographic family) then 1 (legacy);
+    subfamily is name ID 2.  Any parse failure yields ``(None, None)``.
+    """
+    font = None
+    try:
+        font = _TTFont(str(path), lazy=True)
+        name_table = font["name"]
+        family = name_table.getDebugName(16) or name_table.getDebugName(1)
+        subfamily = name_table.getDebugName(2)
+        return (str(family) if family else None,
+                str(subfamily) if subfamily else None)
+    except Exception:
+        return None, None
+    finally:
+        if font is not None:
+            try:
+                font.close()
+            except Exception:
+                pass
+
+
+def _match_family(files: list[Path], family: str) -> Path | None:
+    """The best ``*.ttf`` among *files* for *family*.
+
+    With fontTools available the internal name table is authoritative:
+    the first file whose family matches case-insensitively wins, with a
+    ``Regular`` subfamily preferred when several faces share the family
+    (so an embedded bold file is not mistaken for the regular face).
+    Without fontTools the filename heuristic runs — three passes, in
+    order: exact ``{family}.ttf``, exact ``{family with spaces
+    removed}.ttf``, then the ``{family}*`` glob prefix.  Documented
+    limitation: a heuristic match trusts the filename, so abbreviated
+    vendor names (Windows' ``cour.ttf`` for "Courier New") only hit via
+    the prefix pass.
+    """
+    target = family.lower()
+    if _TTFont is not None:
+        first = None
+        for path in files:
+            internal, subfamily = _read_tt_names(path)
+            if internal is None or internal.lower() != target:
+                continue
+            if (subfamily or "").lower() == "regular":
+                return path
+            if first is None:
+                first = path
+        return first
+
+    tight = target.replace(" ", "")
+    for path in files:
+        if path.stem.lower() == target:
+            return path
+    for path in files:
+        if path.stem.lower() == tight:
+            return path
+    for path in files:
+        if path.stem.lower().startswith(target):
+            return path
+    return None
+
+
+def _resolve_font(family_name: str) -> tuple[Path, str] | None:
+    """Return ``(ttf_path, family_name_for_fpdf)`` if the font can be
+    found on this system, or ``None`` if it cannot.
+
+    Callers must fall back to Helvetica on ``None``.  ``"Helvetica"``
+    itself never resolves: it is an fpdf built-in core font, never a
+    TTF file on disk.  Results (including misses) are cached per
+    family name.
+    """
+    if not family_name or family_name.lower() == "helvetica":
+        return None
+    if family_name in _FONT_CACHE:
+        return _FONT_CACHE[family_name]
+
+    result: tuple[Path, str] | None = None
+    for directory, recursive in _font_search_dirs():
+        if not directory.is_dir():
+            continue
+        pattern = "**/*.ttf" if recursive else "*.ttf"
+        files = sorted(p for p in directory.glob(pattern) if p.is_file())
+        match = _match_family(files, family_name)
+        if match is not None:
+            result = (match, family_name)
+            break
+
+    _FONT_CACHE[family_name] = result
+    return result
+
+
+def _register_font(pdf, family_name: str, resolved, role: str) -> str:
+    """Register *resolved* on *pdf*; return the family to draw with.
+
+    Helvetica when the family is the fpdf built-in, when the system has
+    no matching TTF (logged — the user picked a font this machine does
+    not have), or when fpdf2 rejects the file.  The two roles (body,
+    header) resolve independently.
+    """
+    if resolved is None:
+        if family_name and family_name.lower() != "helvetica":
+            get_logger().warning(
+                f'Font "{family_name}" for {role} text was not found on '
+                "this system; falling back to Helvetica."
+            )
+        return "Helvetica"
+    path, family = resolved
+    try:
+        # fpdf2 keys fonts by family+style and raises on an unknown
+        # key, so the one resolved file must be registered under every
+        # style the exporter's set_font() calls use ("B"/"I" modifiers
+        # stay unchanged).  No separate bold/italic files are
+        # available, so each key embeds the same face.
+        for style in ("", "B", "I", "BI"):
+            pdf.add_font(family, style, str(path))
+    except Exception:
+        get_logger().warning(
+            f'Font "{family_name}" for {role} text could not be loaded '
+            f"from {path}; falling back to Helvetica."
+        )
+        return "Helvetica"
+    return family
 
 
 # ---------------------------------------------------------------------------
@@ -902,6 +1132,12 @@ def export_layout_pdf(
     usable_w = page_w - margin_left - margin_right
 
     # --- Create PDF ---
+    # Fonts resolve BEFORE the instance exists (fpdf needs file paths,
+    # not family names); registration happens on the instance, before
+    # the first add_page() can trigger a header()/footer() draw.
+    body_font_file = _resolve_font(page_config.body_font)
+    header_font_file = _resolve_font(page_config.header_font)
+
     # _LayoutPDF sets margins, auto page break, and the page format
     # itself from page_config, and paints the resolved header/footer
     # rows via fpdf's header()/footer() hooks.
@@ -910,6 +1146,12 @@ def export_layout_pdf(
         footer_texts=footer_texts,
         header_scope=header_scope,
         page_config=page_config,
+    )
+    pdf.body_font = _register_font(
+        pdf, page_config.body_font, body_font_file, "body"
+    )
+    pdf.header_font = _register_font(
+        pdf, page_config.header_font, header_font_file, "header"
     )
     pdf.add_page()
 
@@ -1016,7 +1258,13 @@ def _render_screenshots(
     margin_bottom: float,
     screenshot_config,
 ) -> None:
-    """Render a list of screenshot images in a grid/row."""
+    """Render a list of screenshot images in a grid/row.
+
+    L15.9.3: the gap comes from ``spacing_px``, a ``border_width_px >
+    0`` strokes a rectangle behind every image, and ``align`` shifts
+    the block within the content column.  fpdf2 cannot draw rounded
+    rectangles, so ``corner_radius_px`` falls back to a square rect.
+    """
     # Build grid cells
     photos_per_row = (
         3 if screenshot_config.layout == "grid" else len(screenshot_paths)
@@ -1026,7 +1274,7 @@ def _render_screenshots(
     if not cells:
         return
 
-    spacing = 2.0  # mm between images
+    spacing = _shot_spacing_mm(screenshot_config)  # mm between images
     cols = photos_per_row
     cell_w = (usable_w - spacing * (cols - 1)) / cols
     max_h = screenshot_config.max_height_px * 0.264583  # px → mm @ 96 dpi
@@ -1040,17 +1288,22 @@ def _render_screenshots(
         scaled_w, scaled_h = _fit_image(img_w, img_h, cell_w, max_h)
 
         row_h = row_heights[cell.row]
-        needed = row_h + 4
+        needed = row_h + spacing
 
         # Page break check
         if pdf.get_y() + needed > page_h - margin_bottom:
             pdf.add_page()
 
-        x = margin_left + cell.col * (cell_w + spacing)
+        # The last grid row may be partial; align against what it holds.
+        row_cells = [c for c in cells if c.row == cell.row]
+        block_w = len(row_cells) * cell_w + (len(row_cells) - 1) * spacing
+        origin_x = _shot_block_x(screenshot_config, margin_left, usable_w, block_w)
+        x = origin_x + cell.col * (cell_w + spacing)
         y = pdf.get_y()
 
+        _draw_shot_border(pdf, screenshot_config, x, y, scaled_w, scaled_h)
         pdf.image(str(img_path), x=x, y=y, w=scaled_w, h=scaled_h)
 
         # After last column in row, advance Y
         if cell.col == cols - 1 or cell == cells[-1]:
-            pdf.set_y(y + row_h + 4)
+            pdf.set_y(y + row_h + spacing)

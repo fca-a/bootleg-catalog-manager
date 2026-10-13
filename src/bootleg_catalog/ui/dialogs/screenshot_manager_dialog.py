@@ -1,4 +1,4 @@
-"""Screenshot manager dialog — manual screenshot attachment.
+"""Screenshot manager dialog — manual attachment and FFmpeg generation.
 
 Lists a recording's screenshots with an Auto/Manual origin label and
 lets the user add images (always manual), remove rows, and reorder them.
@@ -10,6 +10,11 @@ reads ``result_screenshot_paths`` / ``result_manual_paths`` /
 ``result_screenshot_split`` after ``Accepted``; all three return
 ``None`` otherwise.
 
+``Generate Screenshots…`` runs FFmpeg on a worker thread to extract
+frames beside the source video; generated paths join the internal
+list as Auto rows (never ``manual_paths``) and leave the dialog
+through the same accessors.
+
 Manual screenshots are embedded into the ``.bootleg`` on save; auto
 sidecar screenshots stay referenced (see session_store).
 """
@@ -18,22 +23,34 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QThread, Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
+    QRadioButton,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from bootleg_catalog.core.multi_part import distribute_screenshot_counts
+from bootleg_catalog.core.screenshot_generator import (
+    ScreenshotPlan,
+    auto_timestamps,
+)
+from bootleg_catalog.core.settings_service import load_settings
 from bootleg_catalog.models.export_recording import ExportRecording
+from bootleg_catalog.ui.workers.screenshot_worker import ScreenshotWorker
 
 _IMAGE_FILTER = "Images (*.jpg *.jpeg *.png *.webp)"
 _THUMBNAIL_HEIGHT_PX = 32
@@ -48,6 +65,12 @@ class ScreenshotManagerDialog(QDialog):
     buttons.  ``Add Image…`` picks files via a dialog filtered to
     images; chosen files are appended as manual.  One row per path:
     re-adding an existing path is ignored.
+
+    ``Generate Screenshots…`` opens :class:`GenerateScreenshotsDialog`,
+    then runs a :class:`~bootleg_catalog.ui.workers.screenshot_worker.
+    ScreenshotWorker` on a :class:`~PySide6.QtCore.QThread` while the
+    dialog's buttons are locked and a status line reports progress.
+    Generated paths are appended as Auto rows on ``finished``.
 
     For two-part recordings the rows are grouped into ``Part 1`` and
     ``Part 2`` sections delimited by ``screenshot_split`` (defaults to
@@ -68,6 +91,14 @@ class ScreenshotManagerDialog(QDialog):
         self._paths = list(recording.screenshot_paths)
         self._manual = set(recording.manual_paths)
         self._row_widgets: list[QWidget] = []
+        # Generation state: source/duration are read once (never the
+        # live recording), and the thread/worker refs mirror the
+        # ExportPreviewWindow probe pair.
+        self._source_path = recording.source_path
+        self._duration = recording.duration
+        self._generating = False
+        self._screenshot_thread: QThread | None = None
+        self._screenshot_worker: ScreenshotWorker | None = None
         # Effective split: None for single-part (one section, no
         # headers); always an int for two-part recordings.
         self._split: int | None = None
@@ -100,19 +131,30 @@ class ScreenshotManagerDialog(QDialog):
         self._rows_box = QVBoxLayout()
         container = QWidget(self)
         container.setLayout(self._rows_box)
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(container)
-        layout.addWidget(scroll)
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setWidget(container)
+        layout.addWidget(self._scroll)
 
-        add_btn = QPushButton("Add Image\u2026", self)
-        add_btn.setObjectName("addImageButton")
-        add_btn.clicked.connect(self._on_add_image)
+        self._add_btn = QPushButton("Add Image\u2026", self)
+        self._add_btn.setObjectName("addImageButton")
+        self._add_btn.clicked.connect(self._on_add_image)
         if self._split is not None:
             # Sections carry their own add buttons; a part-less "Add
             # Image..." would be ambiguous here.
-            add_btn.hide()
-        layout.addWidget(add_btn)
+            self._add_btn.hide()
+        layout.addWidget(self._add_btn)
+
+        self._generate_btn = QPushButton("Generate Screenshots\u2026", self)
+        self._generate_btn.setObjectName("generateScreenshotsButton")
+        self._generate_btn.clicked.connect(self._on_generate_screenshots)
+        layout.addWidget(self._generate_btn)
+
+        # Progress line shown only while the worker runs.
+        self._status_label = QLabel("", self)
+        self._status_label.setObjectName("generationStatusLabel")
+        self._status_label.hide()
+        layout.addWidget(self._status_label)
 
         self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -311,3 +353,253 @@ class ScreenshotManagerDialog(QDialog):
             self._paths[index],
         )
         self._rebuild()
+
+    # -- FFmpeg generation ---------------------------------------------------
+
+    def _on_generate_screenshots(self) -> None:
+        """Plan a generation run and start it on a worker thread."""
+        if not self._duration:
+            QMessageBox.information(
+                self,
+                "Generate Screenshots",
+                "This recording has no known duration.",
+            )
+            return
+
+        modal = GenerateScreenshotsDialog(self._duration, parent=self)
+        if modal.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        if modal.use_auto_timestamps:
+            plan = ScreenshotPlan(
+                auto_timestamps(self._duration, modal.frame_count),
+            )
+        else:
+            plan = ScreenshotPlan(tuple(sorted(modal.manual_timestamps)))
+
+        self._start_generation(plan, load_settings().ffmpeg_path or "ffmpeg",
+                               modal.overwrite)
+
+    def _start_generation(
+        self, plan: ScreenshotPlan, ffmpeg_path: str, overwrite: bool,
+    ) -> None:
+        """Wire a ScreenshotWorker onto a fresh QThread and start it.
+
+        The wiring mirrors ProbeWorker in ExportPreviewWindow:
+        ``started`` → ``run``, ``finished``/``failed`` → ``quit`` and
+        ``worker.deleteLater``, ``thread.finished`` →
+        ``thread.deleteLater``.  This dialog only owns the refs, never
+        the thread's event loop.
+        """
+        self._set_generating(True)
+        total = len(plan.timestamps)
+        self._status_label.setText(f"Generating 0 of {total}\u2026")
+        self._status_label.show()
+
+        thread = QThread()
+        worker = ScreenshotWorker(
+            self._source_path, plan, ffmpeg_path, overwrite,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_progress)
+        worker.finished.connect(self._on_finished_paths)
+        worker.failed.connect(self._on_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._screenshot_thread = thread
+        self._screenshot_worker = worker
+        thread.start()
+
+    def _on_progress(self, current: int, total: int) -> None:
+        """Update the status line after each completed timestamp."""
+        self._status_label.setText(f"Generating {current} of {total}\u2026")
+
+    def _on_finished_paths(self, paths: list) -> None:
+        """Append generated paths as Auto rows, then unlock the dialog."""
+        for path in paths:
+            # One row per path: a regenerated sidecar already listed
+            # is not appended twice.
+            if path not in self._paths:
+                self._paths.append(path)
+        # Deliberately NOT self._manual: generated sidecars are Auto
+        # screenshots; manual_paths is only for hand-attached images.
+        self._status_label.clear()
+        self._status_label.hide()
+        self._set_generating(False)
+        self._rebuild()
+
+    def _on_failed(self, message: str) -> None:
+        """Unlock and report the worker's error."""
+        self._status_label.clear()
+        self._status_label.hide()
+        self._set_generating(False)
+        QMessageBox.warning(self, "Screenshot Error", message)
+
+    def _set_generating(self, running: bool) -> None:
+        """Lock every dialog control while the worker runs."""
+        self._generating = running
+        self._buttons.setEnabled(not running)
+        self._add_btn.setEnabled(not running)
+        self._generate_btn.setEnabled(not running)
+        self._scroll.setEnabled(not running)
+
+
+class GenerateScreenshotsDialog(QDialog):
+    """Choose how many frames to extract and at which timestamps.
+
+    ``How many`` (1–20, default 5) drives Auto mode, which spaces the
+    frames across the runtime via
+    :func:`~bootleg_catalog.core.screenshot_generator.auto_timestamps`.
+    Manual mode lists one timestamp spin box per row (0.0 … duration,
+    step 0.5), added with ``+ Add`` (up to 20 rows) and removed with a
+    per-row ``− Remove``.  The caller reads the property accessors
+    after ``Accepted``; nothing is executed here.
+    """
+
+    def __init__(
+        self,
+        recording_duration: float,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Generate Screenshots")
+        self.setModal(True)
+        self._duration = float(recording_duration)
+        self._manual_values: list[float] = []
+
+        layout = QVBoxLayout(self)
+
+        count_row = QHBoxLayout()
+        count_row.addWidget(QLabel("How many:", self))
+        self._count_spin = QSpinBox(self)
+        self._count_spin.setObjectName("frameCountSpin")
+        self._count_spin.setRange(1, 20)
+        self._count_spin.setValue(5)
+        count_row.addWidget(self._count_spin)
+        count_row.addStretch()
+        layout.addLayout(count_row)
+
+        self._auto_radio = QRadioButton("Auto timestamps", self)
+        self._auto_radio.setObjectName("autoTimestampsRadio")
+        self._auto_radio.setChecked(True)
+        self._auto_radio.toggled.connect(self._on_mode_changed)
+        layout.addWidget(self._auto_radio)
+
+        self._manual_radio = QRadioButton("Manual timestamps", self)
+        self._manual_radio.setObjectName("manualTimestampsRadio")
+        layout.addWidget(self._manual_radio)
+
+        self._manual_box = QGroupBox("Manual timestamps", self)
+        self._manual_box.setObjectName("manualTimestampsBox")
+        manual_layout = QVBoxLayout(self._manual_box)
+        self._manual_rows = QVBoxLayout()
+        manual_layout.addLayout(self._manual_rows)
+        self._add_row_btn = QPushButton("+ Add", self._manual_box)
+        self._add_row_btn.setObjectName("addTimestampButton")
+        self._add_row_btn.clicked.connect(self._on_add_timestamp_row)
+        manual_layout.addWidget(self._add_row_btn)
+        layout.addWidget(self._manual_box)
+
+        self._overwrite_check = QCheckBox(
+            "Overwrite existing screenshots", self,
+        )
+        self._overwrite_check.setObjectName("overwriteCheckbox")
+        layout.addWidget(self._overwrite_check)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+        # Auto is the default mode: the manual rows start hidden.
+        self._on_mode_changed(self._auto_radio.isChecked())
+
+    # -- Result accessors (read by ScreenshotManagerDialog on accept) -------
+
+    @property
+    def frame_count(self) -> int:
+        """The requested frame count (Auto mode)."""
+        return self._count_spin.value()
+
+    @property
+    def use_auto_timestamps(self) -> bool:
+        """True when the Auto radio is selected."""
+        return self._auto_radio.isChecked()
+
+    @property
+    def manual_timestamps(self) -> list[float]:
+        """The manual rows' current values."""
+        return list(self._manual_values)
+
+    @property
+    def overwrite(self) -> bool:
+        """Whether existing sidecars may be replaced."""
+        return self._overwrite_check.isChecked()
+
+    # -- Manual rows ---------------------------------------------------------
+
+    def _on_mode_changed(self, auto: bool) -> None:
+        """Show the manual rows only in Manual mode."""
+        self._manual_box.setVisible(not auto)
+
+    def _on_add_timestamp_row(self) -> None:
+        """Append a manual row, up to 20."""
+        if len(self._manual_values) >= 20:
+            return
+        self._manual_values.append(0.0)
+        self._rebuild_manual_rows()
+
+    def _on_remove_timestamp_row(self, index: int) -> None:
+        """Drop the row at *index*."""
+        if not (0 <= index < len(self._manual_values)):
+            return
+        self._manual_values.pop(index)
+        self._rebuild_manual_rows()
+
+    def _on_row_value_changed(self, index: int, value: float) -> None:
+        """Keep the backing list in step with a spin box edit."""
+        if 0 <= index < len(self._manual_values):
+            self._manual_values[index] = value
+
+    def _rebuild_manual_rows(self) -> None:
+        """Recreate the row widgets from the backing value list."""
+        while self._manual_rows.count():
+            item = self._manual_rows.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        for index in range(len(self._manual_values)):
+            row = QWidget(self._manual_box)
+            inner = QHBoxLayout(row)
+            inner.setContentsMargins(0, 0, 0, 0)
+
+            spin = QDoubleSpinBox(row)
+            spin.setObjectName("timestampSpin")
+            spin.setRange(0.0, self._duration)
+            spin.setSingleStep(0.5)
+            spin.setValue(self._manual_values[index])
+            # Connect after the initial setValue: the list already
+            # holds the same value.
+            spin.valueChanged.connect(
+                lambda value, i=index: self._on_row_value_changed(i, value),
+            )
+            inner.addWidget(spin)
+
+            remove_btn = QPushButton("\u2212 Remove", row)
+            remove_btn.setObjectName("removeTimestampButton")
+            remove_btn.clicked.connect(
+                lambda i=index: self._on_remove_timestamp_row(i),
+            )
+            inner.addWidget(remove_btn)
+
+            self._manual_rows.addWidget(row)

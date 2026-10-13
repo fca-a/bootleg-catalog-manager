@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bootleg-catalog-manager"
+version = "1.0.0"
+description = "Local-first desktop application for cataloging live recordings and building custom PDF/XLSX exports."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "fca" }]
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6>=6.6",
+    "fpdf2>=2.8",
+    "openpyxl>=3.1",
+    "Pillow>=10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/fca-a/bootleg-catalog-manager"
+Repository = "https://github.com/fca-a/bootleg-catalog-manager"
+Issues = "https://github.com/fca-a/bootleg-catalog-manager/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pyinstaller>=6.22",
+]
+
+[project.scripts]
+bootleg-catalog-manager = "bootleg_catalog.app.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"

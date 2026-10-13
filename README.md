@@ -1,5 +1,7 @@
 # Bootleg Catalog Manager
 
+Documentation: https://fca-a.github.io/bootleg-catalog-manager/
+
 A local-first desktop application for cataloging live recordings and building custom PDF/XLSX exports.
 
 ## Overview

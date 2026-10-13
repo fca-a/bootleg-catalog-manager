@@ -44,3 +44,5 @@ logs/
 .mypy_cache/
 .ruff_cache/
 .catalog_cache/
+site/
+source.bat

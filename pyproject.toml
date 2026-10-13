@@ -27,6 +27,10 @@ dev = [
     "pytest>=8.0",
     "pyinstaller>=6.22",
 ]
+docs = [
+  "mkdocs>=1.6",
+  "mkdocs-material>=9.5",
+]
 
 [project.scripts]
 bootleg-catalog-manager = "bootleg_catalog.app.main:main"

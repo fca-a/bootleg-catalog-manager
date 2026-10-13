@@ -1,0 +1,42 @@
+site_name: Bootleg Catalog Manager
+site_url: https://fca-a.github.io/bootleg-catalog-manager/
+repo_url: https://github.com/fca-a/bootleg-catalog-manager
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - content.code.copy
+    - search.suggest
+  palette:
+    - scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - First steps: first-steps.md
+  - Layouts: layouts.md
+  - Screenshots: screenshots.md
+  - Rips and multi-part recordings: rips.md
+  - Export: export.md
+  - Settings: settings.md
+  - Troubleshooting: troubleshooting.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search

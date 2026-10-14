@@ -2,6 +2,8 @@
 
 Documentation: https://fca-a.github.io/bootleg-catalog-manager/
 
+Pre-built installers are available on the [Releases page](https://github.com/fca-a/bootleg-catalog-manager/releases). Currently Windows only; Linux and macOS users can run from source (see Installation below).
+
 A local-first desktop application for cataloging live recordings and building custom PDF/XLSX exports.
 
 ## Overview
@@ -59,6 +61,11 @@ pyinstaller bootleg-catalog-manager.spec
 ```
 
 The executable is written under `dist/`.
+
+To build the Windows installer, run `scripts\build-installer.bat`. It
+requires Inno Setup 6 (https://jrsoftware.org/isdl.php) and expects the
+PyInstaller output to already exist. The result is written to
+`installer-output\BootlegCatalogManagerSetup-<version>.exe`.
 
 ## Layouts
 

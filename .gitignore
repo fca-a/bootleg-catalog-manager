@@ -46,3 +46,7 @@ logs/
 .catalog_cache/
 site/
 source.bat
+
+# Installer
+installer-output/
+*.iss.bak

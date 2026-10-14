@@ -5,9 +5,15 @@ add a recording, pick a layout, and export.
 
 ## Open the application
 
-```bash
-python -m bootleg_catalog.app.main
-```
+Open Bootleg Catalog Manager from the Start Menu (Windows) or from
+wherever you installed it. See [Installation](installation.md) if it is not
+installed yet.
+
+??? note "Running from source"
+
+    ```bash
+    python -m bootleg_catalog.app.main
+    ```
 
 On start, the application offers a choice between creating a new session
 and continuing a recent one. Recent sessions are listed by name; choosing

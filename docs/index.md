@@ -10,8 +10,8 @@ media files.
 
 ## Guides
 
-- [Installation](installation.md) — set up a virtual environment and install
-  the dependencies, including FFmpeg and FFprobe.
+- [Installation](installation.md) — install on Windows with the installer,
+  or run from source on Linux and macOS; FFmpeg and FFprobe setup.
 - [First steps](first-steps.md) — create a session, add recordings, choose a
   layout, and run your first export.
 - [Layouts](layouts.md) — write layout templates with field markers and
@@ -25,14 +25,26 @@ media files.
   suggestion lists.
 - [Troubleshooting](troubleshooting.md) — solutions for common problems.
 
+## Download
+
+Pre-built installers are available on the
+[Releases page](https://github.com/fca-a/bootleg-catalog-manager/releases).
+
+[Download the latest release](https://github.com/fca-a/bootleg-catalog-manager/releases)
+
+The installer is currently Windows-only. Linux and macOS users can run the
+app from source — see [Installation](installation.md).
+
 ## Requirements
 
-- Python 3.12 or newer
-- PySide6 (installed via pip, see [Installation](installation.md))
-- FFmpeg and FFprobe available on `PATH`, or configured in
-  [Settings](settings.md)
+- Windows 10 or newer (for the installer)
+- FFmpeg and FFprobe, installed separately — see
+  [Installation](installation.md)
+- Python 3.12 or newer and PySide6 are only needed for the source install
+  path, not for the installer
 
-Tested on Windows; should work on Linux and macOS.
+Pre-built installer for Windows; Linux and macOS supported via source
+install.
 
 ## License
 

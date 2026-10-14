@@ -90,7 +90,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # No icon yet
+    icon="resources/icons/bcm-icon.ico",
 )
 
 coll = COLLECT(

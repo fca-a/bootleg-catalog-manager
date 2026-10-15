@@ -259,7 +259,7 @@ def default_layout() -> LayoutModel:
                 ),
             ]),
         ],
-        separator="\u2500",
+        separator="-",
     )
 
 

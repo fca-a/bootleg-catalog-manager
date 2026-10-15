@@ -432,6 +432,13 @@ class PreviewWidget(QWidget):
         # belongs to (None for header lines, which have no recording).
         self._screenshot_config = ScreenshotConfig()
         self._active_recording: ExportRecording | None = None
+        # Optional background fills (None = no fill), re-read from the
+        # document's page config on every rebuild: the page frame, the
+        # header/footer bands, the body content area.
+        self._page_background: str | None = None
+        self._header_background: str | None = None
+        self._footer_background: str | None = None
+        self._body_background: str | None = None
         # Slot id -> source image path chosen but not yet copied to the
         # library by LayoutManager.save().
         self._pending_logos: dict[str, Path] = {}
@@ -632,6 +639,17 @@ class PreviewWidget(QWidget):
         )
         self._active_recording = None
 
+        # Background colours: the document's page config wins when one
+        # is loaded (it carries the layout being previewed); a bare
+        # widget falls back to its own page config.
+        bg_config = (
+            doc.layout.page_config if doc is not None else self._page_config
+        )
+        self._page_background = _valid_hex(bg_config.page_background_color)
+        self._header_background = _valid_hex(bg_config.header_background_color)
+        self._footer_background = _valid_hex(bg_config.footer_background_color)
+        self._body_background = _valid_hex(bg_config.body_background_color)
+
         self._page = self._new_page()
         self._pages.append(self._page)
 
@@ -769,6 +787,11 @@ class PreviewWidget(QWidget):
         pixmap, so a borderless rounded frame would paint nothing.
         """
         config = self._screenshot_config
+        # A cell is wrapped when it needs chrome: a stroked border, a
+        # configured background fill, or both.
+        wrap_cells = config.border_width_px > 0 or _valid_hex(
+            getattr(config, "background_color", None)
+        ) is not None
         row = QWidget()
         row.setObjectName("screenshotRow")
         row_layout = QHBoxLayout(row)
@@ -791,7 +814,7 @@ class PreviewWidget(QWidget):
                     f" border: 1px dashed {_SCREENSHOT_PLACEHOLDER_COLOR};"
                 )
                 label.setFixedSize(cell_w, row_h)
-            if config.border_width_px > 0:
+            if wrap_cells:
                 row_layout.addWidget(self._wrap_screenshot_cell(label, config))
             else:
                 row_layout.addWidget(label)
@@ -801,16 +824,25 @@ class PreviewWidget(QWidget):
 
     @staticmethod
     def _wrap_screenshot_cell(label: QLabel, config: ScreenshotConfig) -> QFrame:
-        """Wrap *label* in a QFrame bordering it per the ScreenshotConfig."""
+        """Wrap *label* in a QFrame bordering/filling it per the config.
+
+        The configured ``background_color`` (the fill behind the image)
+        becomes the frame's background; without one the frame stays
+        transparent, so a border-only cell looks unchanged.
+        """
         frame = QFrame()
         frame.setObjectName("screenshotFrame")
         inner = QVBoxLayout(frame)
         inner.setContentsMargins(0, 0, 0, 0)
         inner.setSpacing(0)
         inner.addWidget(label)
+        bg = (
+            _valid_hex(getattr(config, "background_color", None))
+            or "transparent"
+        )
         style = (
             f"border: {config.border_width_px}px solid {config.border_color};"
-            " background-color: transparent;"
+            f" background-color: {bg};"
         )
         if config.corner_radius_px > 0:
             style += f" border-radius: {config.corner_radius_px}px;"
@@ -881,12 +913,18 @@ class PreviewWidget(QWidget):
             )
 
     def _new_page(self) -> QFrame:
-        """Create one white page frame at the current zoom size."""
+        """Create one page frame at the current zoom size.
+
+        The frame background is the configured page colour (white when
+        none); a configured body colour additionally paints a
+        content-column band behind the flowed content.
+        """
         page = QFrame()
         page.setObjectName("previewPage")
+        page_bg = self._page_background or "#FFFFFF"
         page.setStyleSheet(
             "#previewPage {"
-            "  background-color: #FFFFFF;"
+            f"  background-color: {page_bg};"
             f"  border: 1px solid {_PAGE_BORDER_COLOR};"
             "}"
         )
@@ -918,6 +956,25 @@ class PreviewWidget(QWidget):
         if self._footer_row is not None:
             self._add_chrome_band(
                 page, "previewFooter", self._footer_row, at_top=False
+            )
+
+        # Body area: an absolutely-positioned band spanning the content
+        # column.  Created here, BEFORE any content label is added to
+        # the page's layout, so the later labels stack on top of it.
+        if self._body_background is not None:
+            body_band = QWidget(page)
+            body_band.setObjectName("previewBodyBand")
+            body_band.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents
+            )
+            body_band.setGeometry(
+                self._margin_left_px,
+                self._margin_top_px,
+                self._content_w,
+                self._content_h,
+            )
+            body_band.setStyleSheet(
+                f"background-color: {self._body_background};"
             )
         return page
 
@@ -999,6 +1056,11 @@ class PreviewWidget(QWidget):
         band.setObjectName(object_name)
         band.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         band.setGeometry(0, y, self._page_w, band_h)
+        band_bg = (
+            self._header_background if at_top else self._footer_background
+        )
+        if band_bg:
+            band.setStyleSheet(f"background-color: {band_bg};")
 
         anchors = (
             (

@@ -10,7 +10,7 @@
 ; what this script installed under {app}.
 
 #define MyAppName "Bootleg Catalog Manager"
-#define MyAppVersion "1.0.0"      ; read from pyproject.toml at build time
+#define MyAppVersion "1.1.0"      ; read from pyproject.toml at build time
 #define MyAppPublisher "fca"
 #define MyAppURL "https://github.com/fca-a/bootleg-catalog-manager"
 #define MyAppExeName "bootleg-catalog-manager.exe"

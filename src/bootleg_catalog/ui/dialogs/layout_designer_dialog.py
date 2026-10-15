@@ -286,6 +286,20 @@ class LayoutDesignerDialog(QDialog):
         arch_layout.addWidget(self._arch_list)
         layout.addWidget(arch_group)
 
+        # Layout tokens: literal layout syntax that is not a field, so
+        # it cannot come from the registry.  Appended unconditionally
+        # after the two field groups; the entry inserts a starting
+        # point the user edits in place (no spinbox).
+        tokens_group = QGroupBox("Layout tokens")
+        tokens_layout = QVBoxLayout(tokens_group)
+        self._token_list = QListWidget()
+        self._token_list.addItem("Screenshot count")
+        self._token_list.itemDoubleClicked.connect(
+            lambda item: self._insert_text("[Screenshot:3]")
+        )
+        tokens_layout.addWidget(self._token_list)
+        layout.addWidget(tokens_group)
+
         return widget
 
     def _build_editors(self) -> QWidget:
@@ -434,13 +448,17 @@ class LayoutDesignerDialog(QDialog):
 
     def _insert_field(self, field_name: str, *, technical: bool) -> None:
         """Insert a field token into the focused editor."""
+        token = f"{{{field_name}}}" if technical else f"[{field_name}]"
+        self._insert_text(token)
+
+    def _insert_text(self, text: str) -> None:
+        """Insert literal *text* at the cursor of the focused editor."""
         editor = self._last_focused
         if editor is None:
             editor = self._show_header_edit
 
-        token = f"{{{field_name}}}" if technical else f"[{field_name}]"
         cursor = editor.textCursor()
-        cursor.insertText(token)
+        cursor.insertText(text)
         editor.setFocus()
 
     # -- Inline formatting toolbar ------------------------------------------
@@ -1105,6 +1123,48 @@ class PageSetupDialog(QDialog):
         self._on_shot_layout_changed(shots.layout)
         layout.addWidget(shots_box)
 
+        # --- Backgrounds ---
+        # One swatch-button per background colour, same widget shape as
+        # the border-colour control above: the button text and background
+        # show the current colour ("None" when unset).  Left-click picks
+        # a colour; right-click clears back to None.  The screenshot
+        # colour belongs to the ScreenshotConfig, the other four to the
+        # PageConfig — see _on_accept.
+        bg_box = QGroupBox("Backgrounds")
+        bg_box.setObjectName("backgroundsGroupBox")
+        bg_layout = QGridLayout(bg_box)
+        self._bg_colors: dict[str, str | None] = {
+            "page": page_config.page_background_color,
+            "header": page_config.header_background_color,
+            "footer": page_config.footer_background_color,
+            "body": page_config.body_background_color,
+            "screenshot": shots.background_color,
+        }
+        self._bg_buttons: dict[str, QPushButton] = {}
+        for row, (key, label_text, object_name) in enumerate((
+            ("page", "Page background", "pageBackgroundButton"),
+            ("header", "Header background", "headerBackgroundButton"),
+            ("footer", "Footer background", "footerBackgroundButton"),
+            ("body", "Body background", "bodyBackgroundButton"),
+            ("screenshot", "Screenshot background", "screenshotBackgroundButton"),
+        )):
+            bg_layout.addWidget(QLabel(label_text + ":"), row, 0)
+            button = QPushButton(self)
+            button.setObjectName(object_name)
+            button.clicked.connect(
+                lambda _checked=False, k=key: self._on_bg_clicked(k)
+            )
+            button.setContextMenuPolicy(
+                Qt.ContextMenuPolicy.CustomContextMenu
+            )
+            button.customContextMenuRequested.connect(
+                lambda _pos, k=key: self._on_bg_cleared(k)
+            )
+            self._bg_buttons[key] = button
+            bg_layout.addWidget(button, row, 1)
+            self._update_bg_swatch(key)
+        layout.addWidget(bg_box)
+
         # --- Buttons ---
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -1151,6 +1211,39 @@ class PageSetupDialog(QDialog):
         self._shot_border_color = colour.name()
         self._update_shot_border_swatch()
 
+    def _update_bg_swatch(self, key: str) -> None:
+        """Show one background colour as its button's swatch (or "None")."""
+        colour = self._bg_colors[key]
+        button = self._bg_buttons[key]
+        if colour is None:
+            button.setText("None")
+            button.setStyleSheet(
+                "background-color: #FFFFFF; color: #6B7280;"
+                " border: 1px solid #9CA3AF;"
+            )
+        else:
+            button.setText(colour)
+            button.setStyleSheet(
+                f"background-color: {colour}; border: 1px solid #9CA3AF;"
+            )
+
+    def _on_bg_clicked(self, key: str) -> None:
+        """Pick one background colour with the colour dialog."""
+        current = self._bg_colors[key] or "#FFFFFF"
+        colour = QColorDialog.getColor(
+            QColor(current), self, "Background colour"
+        )
+        if not colour.isValid():
+            return
+        # QColor.name() already returns the lowercase "#rrggbb" form.
+        self._bg_colors[key] = colour.name()
+        self._update_bg_swatch(key)
+
+    def _on_bg_cleared(self, key: str) -> None:
+        """Clear one background colour back to None (right-click)."""
+        self._bg_colors[key] = None
+        self._update_bg_swatch(key)
+
     def _update_font_warning(self, label: QLabel, family: str) -> None:
         """Show *label* beneath a font combo only for a missing family.
 
@@ -1194,6 +1287,10 @@ class PageSetupDialog(QDialog):
             # Family names (str) as displayed by the combos.
             body_font=self._body_font_combo.currentFont().family(),
             header_font=self._header_font_combo.currentFont().family(),
+            page_background_color=self._bg_colors["page"],
+            header_background_color=self._bg_colors["header"],
+            footer_background_color=self._bg_colors["footer"],
+            body_background_color=self._bg_colors["body"],
         )
         self._result_screenshot_config = replace(
             self._initial_screenshots,
@@ -1206,5 +1303,6 @@ class PageSetupDialog(QDialog):
             border_color=self._shot_border_color,
             corner_radius_px=self._shot_corner_radius_spin.value(),
             align=self._shot_align_combo.currentText().lower(),
+            background_color=self._bg_colors["screenshot"],
         )
         self.accept()

@@ -144,16 +144,17 @@ class TestTechnicalFieldResolution:
 # ---------------------------------------------------------------------------
 
 class TestArchivalFields:
-    """All 14 archival fields must be registered correctly."""
+    """All 15 archival fields must be registered correctly."""
 
     EXPECTED = [
         "Title", "Year", "Date", "Venue", "Location", "Country",
         "Tour", "Show", "Generation", "Audio Source",
         "Video Source", "Master", "Notes", "Description",
+        "Trade Status",
     ]
 
     def test_count(self) -> None:
-        assert len(ARCHIVAL_FIELDS) == 14
+        assert len(ARCHIVAL_FIELDS) == 15
 
     def test_all_expected_present(self) -> None:
         for name in self.EXPECTED:
@@ -250,6 +251,36 @@ class TestArchivalFieldResolution:
             assert result is None, f"{name} should be None for empty recording"
 
 
+class TestTradeStatusField:
+    """Trade Status — archival field resolving the recording's value (L15.9.5)."""
+
+    def test_registered_and_resolves(self) -> None:
+        spec = get_field_spec("Trade Status")
+        assert spec is not None
+        assert spec.category == FieldCategory.ARCHIVAL
+        assert is_archival("Trade Status")
+
+        rec = ExportRecording(source_path="/x.mkv", trade_status="NFT")
+        assert ARCHIVAL_FIELDS["Trade Status"].resolver(rec) == "NFT"
+
+        # Unset resolves to the empty string through the field resolver,
+        # like every other optional archival field.
+        from bootleg_catalog.core.field_resolver import FieldResolver
+        from bootleg_catalog.models.layout_model import FieldType, LayoutElement
+
+        element = LayoutElement(
+            kind="field", content="Trade Status",
+            field_type=FieldType.ARCHIVAL,
+        )
+        empty = ExportRecording(source_path="/x.mkv")
+        resolved, err = FieldResolver().resolve_element(element, rec)
+        assert err is None
+        assert resolved.text == "NFT"
+        resolved, err = FieldResolver().resolve_element(element, empty)
+        assert err is None
+        assert resolved.text == ""
+
+
 # ---------------------------------------------------------------------------
 # Suggestion fields
 # ---------------------------------------------------------------------------
@@ -305,8 +336,8 @@ class TestUnifiedLookup:
     """get_field_spec and helpers work across all categories."""
 
     def test_total_field_count(self) -> None:
-        # 11 technical + 14 archival + 3 suggestion = 28
-        assert len(ALL_FIELDS) == 28
+        # 11 technical + 15 archival + 3 suggestion = 29
+        assert len(ALL_FIELDS) == 29
 
     def test_get_technical(self) -> None:
         spec = get_field_spec("Duration")
@@ -355,7 +386,7 @@ class TestUnifiedLookup:
 
     def test_all_field_names(self) -> None:
         names = all_field_names()
-        assert len(names) == 28
+        assert len(names) == 29
         assert "Duration" in names
         assert "Show" in names
         assert "Type" in names

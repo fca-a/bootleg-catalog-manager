@@ -387,6 +387,116 @@ def test_embedded_cache_refreshed_when_bytes_change(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Embed-all-screenshots (save-time choice; no format change)
+# ---------------------------------------------------------------------------
+
+def test_embed_all_screenshots_embeds_every_path(tmp_path: Path) -> None:
+    """embed_paths = every screenshot embeds them all, not just manual.
+
+    A spy on the zip writer confirms each path is written into the
+    archive (auto sidecars included), and the manifest marks them all
+    embedded.
+    """
+    shots = [tmp_path / f"shot{i}.jpg" for i in range(5)]
+    for i, s in enumerate(shots):
+        s.write_bytes(b"\xff\xd8 embedded-%d" % i)
+    rec = _full_recording(screenshots=[str(s) for s in shots])
+    rec.manual_paths = {str(shots[0])}  # only one is manual
+    data = SessionData(display_name="All", layout=_layout(), recordings=[rec])
+
+    real_write = zipfile.ZipFile.write
+    written: list[str] = []
+
+    def spy_write(self, filename, arcname=None, compress_type=None):
+        written.append(arcname)
+        return real_write(
+            self, filename, arcname=arcname, compress_type=compress_type
+        )
+
+    with patch("zipfile.ZipFile.write", spy_write):
+        path = save_session(
+            data, tmp_path / "session.bootleg",
+            embed_paths={str(s) for s in shots},
+        )
+
+    assert len(written) == len(shots)  # every screenshot written
+    with zipfile.ZipFile(path, "r") as zf:
+        names = zf.namelist()
+    embedded = [n for n in names if n.startswith("screenshots/")]
+    assert len(embedded) == len(shots)
+
+
+def test_embed_all_reload_resolves_to_cache_dir(tmp_path: Path) -> None:
+    """40+ embedded screenshots all resolve into the cache and exist.
+
+    Verifies the load side at volume: every resolved path lands under
+    the per-session cache directory, exists, and matches the source
+    bytes.
+    """
+    shots = [tmp_path / f"auto{i:02d}.jpg" for i in range(42)]
+    for i, s in enumerate(shots):
+        s.write_bytes(b"\xff\xd8 auto-%d" % i)
+    rec = _full_recording(screenshots=[str(s) for s in shots])
+    data = SessionData(display_name="Many", layout=_layout(), recordings=[rec])
+    appdata = tmp_path / "appdata"
+
+    with patch(
+        "bootleg_catalog.core.session_store.app_data_dir",
+        return_value=appdata,
+    ):
+        path = save_session(
+            data, tmp_path / "session.bootleg",
+            embed_paths={str(s) for s in shots},
+        )
+        loaded = load_session(path)
+
+    resolved = loaded.recordings[0].screenshot_paths
+    assert len(resolved) == 42
+    for source, cached_str in zip(shots, resolved):
+        cached = Path(cached_str)
+        assert cached != source
+        assert appdata in cached.parents
+        assert "cache" in cached.relative_to(appdata).parts
+        assert cached.is_file()
+        assert cached.read_bytes() == source.read_bytes()
+
+
+def test_manual_only_embed_references_auto_paths(tmp_path: Path) -> None:
+    """embed_paths = manual set keeps auto sidecars referenced by path.
+
+    The current behaviour: only the manual attachment is embedded; the
+    referenced auto paths survive a reload unchanged.
+    """
+    manual = tmp_path / "cover.jpg"
+    manual.write_bytes(b"\xff\xd8 manual")
+    auto1 = tmp_path / "auto1.jpg"
+    auto1.write_bytes(b"\xff\xd8 auto1")
+    auto2 = tmp_path / "auto2.jpg"
+    auto2.write_bytes(b"\xff\xd8 auto2")
+    rec = _full_recording(screenshots=[str(manual), str(auto1), str(auto2)])
+    rec.manual_paths = {str(manual)}
+    data = SessionData(display_name="Manual", layout=_layout(), recordings=[rec])
+    appdata = tmp_path / "appdata"
+
+    with patch(
+        "bootleg_catalog.core.session_store.app_data_dir",
+        return_value=appdata,
+    ):
+        path = save_session(
+            data, tmp_path / "session.bootleg", embed_paths={str(manual)}
+        )
+        loaded = load_session(path)
+
+    resolved = loaded.recordings[0].screenshot_paths
+    # manual -> extracted into the cache; auto -> preserved as-is.
+    assert resolved[0] != str(manual)
+    assert Path(resolved[0]).is_file()
+    assert resolved[1] == str(auto1)
+    assert resolved[2] == str(auto2)
+    assert loaded.recordings[0].manual_paths == {resolved[0]}
+
+
+# ---------------------------------------------------------------------------
 # Manual vs auto screenshot origins (L15.4, manifest v2)
 # ---------------------------------------------------------------------------
 
@@ -1025,6 +1135,43 @@ def test_v4_manifest_without_is_rip_loads_as_false(tmp_path: Path) -> None:
 
     assert loaded.format_version == 4
     assert loaded.recordings[0].is_rip is False
+
+
+def test_trade_status_round_trips_and_defaults_none(tmp_path: Path) -> None:
+    """Trade status survives save/load; manifests written before the
+    field existed load as None (backward-compatible extra field,
+    format version stays 4)."""
+    marked = ExportRecording(source_path=_SOURCE_PATH, trade_status="NFTF")
+    unmarked = ExportRecording(source_path="D:/media/encore.mkv")
+    data = SessionData(
+        display_name="Trade",
+        layout=_layout(),
+        recordings=[marked, unmarked],
+    )
+
+    path = save_session(data, tmp_path / "trade.bootleg")
+    with zipfile.ZipFile(path, "r") as zf:
+        manifest = json.loads(zf.read(MANIFEST_NAME))
+    assert manifest["recordings"][0]["trade_status"] == "NFTF"
+    assert manifest["recordings"][1]["trade_status"] is None
+
+    loaded = load_session(path)
+    assert loaded.recordings[0].trade_status == "NFTF"
+    assert loaded.recordings[1].trade_status is None
+
+    # A v4 manifest without the key loads as None via the dataclass default.
+    old_manifest = {
+        "format_version": 4,
+        "display_name": "Old",
+        "created_at": _CREATED_AT,
+        "modified_at": _CREATED_AT,
+        "layout": _layout().to_dict(),
+        "recordings": [_v3_recording_blob()],
+        "screenshots": [],
+    }
+    old_path = _write_manifest_zip(tmp_path / "v4-no-trade.bootleg", old_manifest)
+    old_loaded = load_session(old_path)
+    assert old_loaded.recordings[0].trade_status is None
 
 
 # ---------------------------------------------------------------------------

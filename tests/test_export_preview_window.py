@@ -34,6 +34,7 @@ from bootleg_catalog.models.layout_model import (
     LayoutLine,
     LayoutModel,
     LogoSlot,
+    PageConfig,
     ScreenshotConfig,
     TextSlot,
 )
@@ -553,6 +554,28 @@ class TestInlineScreenshotToken:
 
         assert widths(200) == [200]
         assert widths(100) == [100]
+
+    def test_wide_screenshot_fits_both_constraints_by_one_scale(
+        self, qt_app, tmp_path
+    ) -> None:
+        """Bug C: 200x50 in a 100x100 box renders 100x25, never 100x100.
+
+        Both max_width_px and max_height_px bind: the image must be
+        scaled by a single min(...) factor so the aspect ratio holds.
+        """
+        path = str(_make_png(tmp_path / "wide.png", size=(200, 50)))
+        doc = _screenshot_doc(
+            [path],
+            n=1,
+            max_width_px=100,
+            max_height_px=100,
+        )
+        widget = PreviewWidget()
+        widget._zoom_combo.setCurrentText("100%")
+        widget.set_document(doc)
+
+        pix = _pixmap_labels(widget)[0].pixmap()
+        assert (pix.width(), pix.height()) == (100, 25)
 
 
 class TestScreenshotVisualStyling:
@@ -1137,6 +1160,44 @@ class TestPreviewLogoSlots:
 # ExportPreviewWindow tests
 # ---------------------------------------------------------------------------
 
+class TestPreviewBackgrounds:
+    """Page/screenshot backgrounds mirror the layout's colours.
+
+    The page frame's stylesheet carries the configured page colour; a
+    screenshot cell wrapped for its background colour carries it on the
+    ``screenshotFrame``.
+    """
+
+    def test_page_background_colour_renders_on_page_frame(self, qt_app) -> None:
+        """A document with page_background_color styles the page frame."""
+        widget = PreviewWidget()
+        widget._zoom_combo.setCurrentText("100%")
+        doc = _screenshot_doc([])
+        doc.layout.page_config = PageConfig(page_background_color="#112233")
+        widget.set_document(doc)
+        qt_app.processEvents()
+
+        page = widget.findChild(QFrame, "previewPage")
+        assert page is not None
+        assert "#112233" in page.styleSheet().lower()
+
+    def test_screenshot_background_colour_renders_on_cell_frame(
+        self, qt_app, tmp_path: Path,
+    ) -> None:
+        """A screenshot_config background lands on the cell frame."""
+        shot = _make_png(tmp_path / "shot.png")
+        widget = PreviewWidget()
+        widget._zoom_combo.setCurrentText("100%")
+        widget.set_document(
+            _screenshot_doc([str(shot)], n=1, background_color="#445566")
+        )
+        qt_app.processEvents()
+
+        frame = widget.findChild(QFrame, "screenshotFrame")
+        assert frame is not None
+        assert "#445566" in frame.styleSheet().lower()
+
+
 class TestExportPreviewWindow:
     def test_opens_empty(self, qt_app) -> None:
         """Window opens with empty session, preview shows empty state."""
@@ -1326,6 +1387,79 @@ class TestExportPreviewWindow:
         ):
             win._on_remove_recording(rec.source_path)
         assert service.session.recording_count == 1
+
+    @staticmethod
+    def _save_as_service() -> ExportSessionService:
+        """A named service with one recording: 3 shots, 1 manual."""
+        service = _make_service()
+        service.set_display_name("Screens")
+        rec = _make_recording(
+            screenshot_paths=["C:/s/a.jpg", "C:/s/b.jpg", "C:/s/c.jpg"],
+        )
+        rec.manual_paths = {"C:/s/a.jpg"}
+        service.session.add_recording(rec)
+        return service
+
+    def test_save_as_yes_embeds_all_screenshots(self, qt_app, tmp_path) -> None:
+        """Embed question Yes -> service.save gets every screenshot path."""
+        service = self._save_as_service()
+        win = ExportPreviewWindow(service)
+        out = str(tmp_path / "out.bootleg")
+        with patch(
+            "bootleg_catalog.ui.export_preview_window.QFileDialog.getSaveFileName",
+            return_value=(out, ""),
+        ), patch(
+            "bootleg_catalog.ui.export_preview_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ), patch(
+            "bootleg_catalog.core.export_session_service.save_session",
+        ) as mock_save, patch(
+            "bootleg_catalog.ui.export_preview_window.RecentSessions",
+        ):
+            win._on_save_as()
+        assert mock_save.call_args.kwargs["embed_paths"] == {
+            "C:/s/a.jpg", "C:/s/b.jpg", "C:/s/c.jpg",
+        }
+
+    def test_save_as_no_embeds_manual_only(self, qt_app, tmp_path) -> None:
+        """Embed question No -> only the manual set (current behaviour)."""
+        service = self._save_as_service()
+        win = ExportPreviewWindow(service)
+        out = str(tmp_path / "out.bootleg")
+        with patch(
+            "bootleg_catalog.ui.export_preview_window.QFileDialog.getSaveFileName",
+            return_value=(out, ""),
+        ), patch(
+            "bootleg_catalog.ui.export_preview_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ), patch(
+            "bootleg_catalog.core.export_session_service.save_session",
+        ) as mock_save, patch(
+            "bootleg_catalog.ui.export_preview_window.RecentSessions",
+        ):
+            win._on_save_as()
+        assert mock_save.call_args.kwargs["embed_paths"] == {"C:/s/a.jpg"}
+
+    def test_save_as_embed_cancel_aborts(self, qt_app, tmp_path) -> None:
+        """Embed question Cancel -> nothing written, _current_path unchanged."""
+        service = self._save_as_service()
+        win = ExportPreviewWindow(service)
+        assert win._current_path is None
+        out = str(tmp_path / "out.bootleg")
+        with patch(
+            "bootleg_catalog.ui.export_preview_window.QFileDialog.getSaveFileName",
+            return_value=(out, ""),
+        ), patch(
+            "bootleg_catalog.ui.export_preview_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ), patch(
+            "bootleg_catalog.core.export_session_service.save_session",
+        ) as mock_save, patch(
+            "bootleg_catalog.ui.export_preview_window.RecentSessions",
+        ):
+            win._on_save_as()
+        mock_save.assert_not_called()
+        assert win._current_path is None
 
     def test_export_pdf_cancelled(self, qt_app) -> None:
         """PDF export: QFileDialog cancelled → no file written."""
@@ -1603,6 +1737,99 @@ class TestExportPreviewWindow:
         assert "from bootleg_catalog.core.catalog" not in content
         assert "from bootleg_catalog.database" not in content
         assert "sqlite3" not in content
+
+
+# ---------------------------------------------------------------------------
+# + Add Audio Recording… (source dialog → audio probe → add)
+# ---------------------------------------------------------------------------
+
+class TestAddAudioRecordingFlow:
+    """The audio button routes through AddMediaSourceDialog and the
+    audio probe — one test per choice, per the phase brief."""
+
+    def test_button_opens_media_source_dialog_for_audio(self, qt_app) -> None:
+        """Clicking + Add Audio Recording… asks file-or-folder for audio."""
+        service = _make_service()
+        win = ExportPreviewWindow(service)
+        with patch(
+            "bootleg_catalog.ui.export_preview_window.AddMediaSourceDialog",
+        ) as MockSource:
+            MockSource.return_value.exec.return_value = (
+                QDialog.DialogCode.Rejected
+            )
+            win._add_audio_btn.click()
+
+        MockSource.assert_called_once()
+        assert MockSource.call_args.args[0] == "audio"
+
+    def test_single_file_choice_runs_audio_probe(self, qt_app) -> None:
+        """"Single file…" probes that file through the audio path."""
+        service = _make_service()
+        win = ExportPreviewWindow(service)
+        probed = _make_recording(
+            source_path="/albums/live/01.mp3",
+            is_audio=True,
+            tracks=("/albums/live/01.mp3",),
+        )
+        with patch(
+            "bootleg_catalog.ui.export_preview_window.AddMediaSourceDialog",
+        ) as MockSource, patch(
+            "bootleg_catalog.ui.export_preview_window.QFileDialog"
+            ".getOpenFileName",
+            return_value=("/albums/live/01.mp3", ""),
+        ), patch.object(
+            service,
+            "probe_audio_recording_from_path",
+            return_value=probed,
+        ) as mock_probe, patch(
+            "bootleg_catalog.ui.export_preview_window.AddRecordingDialog",
+        ) as MockAdd:
+            MockSource.return_value.exec.return_value = (
+                QDialog.DialogCode.Accepted
+            )
+            MockSource.return_value.result_choice = "file"
+            MockAdd.return_value.exec.return_value = (
+                QDialog.DialogCode.Rejected
+            )
+            win._add_audio_btn.click()
+
+        mock_probe.assert_called_once_with("/albums/live/01.mp3")
+        assert service.session.recording_count == 0  # dialog rejected
+
+    def test_folder_choice_runs_folder_audio_probe(self, qt_app) -> None:
+        """"Folder…" probes the album folder through the audio path."""
+        service = _make_service()
+        win = ExportPreviewWindow(service)
+        album = _make_recording(
+            source_path="C:/albums/live",
+            is_audio=True,
+            tracks=("C:/albums/live/01.mp3",),
+        )
+        with patch(
+            "bootleg_catalog.ui.export_preview_window.AddMediaSourceDialog",
+        ) as MockSource, patch(
+            "bootleg_catalog.ui.export_preview_window.QFileDialog"
+            ".getExistingDirectory",
+            return_value="C:/albums/live",
+        ), patch.object(
+            service,
+            "probe_audio_recording_from_path",
+            return_value=album,
+        ) as mock_probe, patch(
+            "bootleg_catalog.ui.export_preview_window.AddRecordingDialog",
+        ) as MockAdd:
+            MockSource.return_value.exec.return_value = (
+                QDialog.DialogCode.Accepted
+            )
+            MockSource.return_value.result_choice = "folder"
+            MockAdd.return_value.exec.return_value = (
+                QDialog.DialogCode.Rejected
+            )
+            win._add_audio_btn.click()
+
+        mock_probe.assert_called_once_with("C:/albums/live")
+        assert service.session.recording_count == 0  # dialog rejected
+
 
 # ---------------------------------------------------------------------------
 # Multi-part add flow (L15.6.2b)
@@ -2128,6 +2355,9 @@ class TestWindowTitle:
             return_value=("Salvo", True),
         ), patch(
             "bootleg_catalog.ui.export_preview_window.RecentSessions",
+        ), patch(
+            "bootleg_catalog.ui.export_preview_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
         ):
             win._on_save()  # no current path -> Save As
         assert "*" not in win.windowTitle()
@@ -2158,6 +2388,9 @@ class TestSaveAndSaveAs:
             "bootleg_catalog.ui.export_preview_window.QInputDialog.getText",
         ) as mock_prompt, patch(
             "bootleg_catalog.ui.export_preview_window.RecentSessions",
+        ), patch(
+            "bootleg_catalog.ui.export_preview_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
         ):
             win._on_save_as()
         mock_prompt.assert_not_called()  # named sessions are never prompted
@@ -2177,6 +2410,9 @@ class TestSaveAndSaveAs:
             return_value=("Sem Extensao", True),
         ), patch(
             "bootleg_catalog.ui.export_preview_window.RecentSessions",
+        ), patch(
+            "bootleg_catalog.ui.export_preview_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
         ):
             win._on_save_as()
         expected = tmp_path / "sem-extensao.bootleg"
@@ -2196,6 +2432,9 @@ class TestSaveAndSaveAs:
             return_value=("Nome Bonito", True),
         ) as mock_prompt, patch(
             "bootleg_catalog.ui.export_preview_window.RecentSessions",
+        ), patch(
+            "bootleg_catalog.ui.export_preview_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
         ):
             win._on_save_as()
         mock_prompt.assert_called_once()
@@ -2233,6 +2472,9 @@ class TestSaveAndSaveAs:
             "bootleg_catalog.ui.export_preview_window.QInputDialog.getText",
         ) as mock_prompt, patch(
             "bootleg_catalog.ui.export_preview_window.RecentSessions",
+        ), patch(
+            "bootleg_catalog.ui.export_preview_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
         ):
             win._on_save_as()
         mock_prompt.assert_not_called()
@@ -2363,7 +2605,10 @@ class TestRecentSessionsIntegration:
             return_value=("Recente", True),
         ), patch(
             "bootleg_catalog.ui.export_preview_window.RecentSessions",
-        ) as MockRecents:
+        ) as MockRecents, patch(
+            "bootleg_catalog.ui.export_preview_window.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
             win._on_save()
         MockRecents.return_value.add.assert_called_once_with("Recente", target)
 

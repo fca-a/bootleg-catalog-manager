@@ -330,6 +330,47 @@ class TestScreenshotConfig:
 
 
 # ---------------------------------------------------------------------------
+# Background colours (page / header / footer / body / screenshot)
+# ---------------------------------------------------------------------------
+
+class TestBackgroundColors:
+    """All five background colours round-trip; invalid values → None."""
+
+    def test_roundtrip_and_invalid_falls_back_to_none(self) -> None:
+        pc = PageConfig(
+            page_background_color="#112233",
+            header_background_color="#223344",
+            footer_background_color="#334455",
+            body_background_color="#445566",
+        )
+        restored = PageConfig.from_dict(pc.to_dict())
+        assert restored.page_background_color == "#112233"
+        assert restored.header_background_color == "#223344"
+        assert restored.footer_background_color == "#334455"
+        assert restored.body_background_color == "#445566"
+
+        sc = ScreenshotConfig(background_color="#778899")
+        restored_shot = ScreenshotConfig.from_dict(sc.to_dict())
+        assert restored_shot == sc
+        assert restored_shot.background_color == "#778899"
+
+        # Invalid non-None values fall back to None silently, and a
+        # payload predating the keys loads with None for all five.
+        bad_page = PageConfig.from_dict({
+            "page_background_color": "red",
+            "footer_background_color": "#12345",   # only 5 digits
+        })
+        assert bad_page.page_background_color is None
+        assert bad_page.footer_background_color is None
+        assert PageConfig.from_dict({}).body_background_color is None
+        assert PageConfig.from_dict({}).header_background_color is None
+        assert ScreenshotConfig.from_dict(
+            {"background_color": 42}
+        ).background_color is None
+        assert ScreenshotConfig.from_dict({}).background_color is None
+
+
+# ---------------------------------------------------------------------------
 # TextSlot / HeaderConfig / FooterConfig (L15.7d)
 # ---------------------------------------------------------------------------
 

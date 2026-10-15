@@ -6,10 +6,10 @@ application data directory.
 Empty string values for paths are treated as "not configured" — the
 existing fallback behaviour (env var → system PATH) applies.
 
-Suggestion lists for Type and Source are user-configurable and stored
-in settings.json.  They provide autocomplete values for the UI and are
-NOT closed enums — archival ``type`` and ``source`` always store
-free-form strings.
+Suggestion lists for Type, Source, Quality, and Trade Status are
+user-configurable and stored in settings.json.  They provide
+autocomplete values for the UI and are NOT closed enums — the archival
+fields always store free-form strings.
 """
 
 from __future__ import annotations
@@ -91,6 +91,10 @@ DEFAULT_SOURCE_SUGGESTIONS: list[str] = [
 
 DEFAULT_QUALITY_SUGGESTIONS: list[str] = list(QUALITY_VALUES)
 
+# Trade Status — free text; NFT = Not For Trade, NFTF = Not For Trade
+# Forever.  The list is a starting point, not an enum.
+DEFAULT_TRADE_STATUS_SUGGESTIONS: list[str] = ["NFT", "NFTF"]
+
 # Not part of AppSettings: master is a fixed one-item suggestion list;
 # the dialogs read it via MASTER_VALUES.
 DEFAULT_MASTER_SUGGESTIONS: list[str] = list(MASTER_VALUES)
@@ -120,6 +124,7 @@ class AppSettings:
     type_suggestions: list[str] = field(default_factory=lambda: list(DEFAULT_TYPE_SUGGESTIONS))
     source_suggestions: list[str] = field(default_factory=lambda: list(DEFAULT_SOURCE_SUGGESTIONS))
     quality_suggestions: list[str] = field(default_factory=lambda: list(DEFAULT_QUALITY_SUGGESTIONS))
+    trade_status_suggestions: list[str] = field(default_factory=lambda: list(DEFAULT_TRADE_STATUS_SUGGESTIONS))
 
     # Explicit __eq__ so mutable default_factory lists are compared by value.
     def __eq__(self, other: object) -> bool:
@@ -131,6 +136,7 @@ class AppSettings:
             and self.type_suggestions == other.type_suggestions
             and self.source_suggestions == other.source_suggestions
             and self.quality_suggestions == other.quality_suggestions
+            and self.trade_status_suggestions == other.trade_status_suggestions
         )
 
     def to_dict(self) -> dict:
@@ -141,6 +147,7 @@ class AppSettings:
                 "type": list(self.type_suggestions),
                 "source": list(self.source_suggestions),
                 "quality": list(self.quality_suggestions),
+                "trade_status": list(self.trade_status_suggestions),
             },
         }
 
@@ -153,10 +160,12 @@ class AppSettings:
         raw_type = suggestion_lists.get("type")
         raw_source = suggestion_lists.get("source")
         raw_quality = suggestion_lists.get("quality")
+        raw_trade = suggestion_lists.get("trade_status")
 
         type_suggestions = _filter_string_list(raw_type)
         source_suggestions = _filter_string_list(raw_source)
         quality_suggestions = _filter_string_list(raw_quality)
+        trade_status_suggestions = _filter_string_list(raw_trade)
 
         return cls(
             ffmpeg_path=data.get("ffmpeg_path", ""),
@@ -164,6 +173,7 @@ class AppSettings:
             type_suggestions=type_suggestions if type_suggestions is not None else list(DEFAULT_TYPE_SUGGESTIONS),
             source_suggestions=source_suggestions if source_suggestions is not None else list(DEFAULT_SOURCE_SUGGESTIONS),
             quality_suggestions=quality_suggestions if quality_suggestions is not None else list(DEFAULT_QUALITY_SUGGESTIONS),
+            trade_status_suggestions=trade_status_suggestions if trade_status_suggestions is not None else list(DEFAULT_TRADE_STATUS_SUGGESTIONS),
         )
 
 

@@ -168,6 +168,13 @@ class _ExportRecordingFormDialog(QDialog):
         self.quality_edit.addItems(list(settings.quality_suggestions))
         self._set_combo(self.quality_edit, rec.quality or "")
 
+        # Trade Status — editable combo from settings
+        self.trade_status_edit = QComboBox()
+        self.trade_status_edit.setEditable(True)
+        self.trade_status_edit.addItem("")
+        self.trade_status_edit.addItems(list(settings.trade_status_suggestions))
+        self._set_combo(self.trade_status_edit, rec.trade_status or "")
+
         # Master — combo from MASTER_VALUES
         self.master_edit = QComboBox()
         self.master_edit.setEditable(True)
@@ -196,6 +203,7 @@ class _ExportRecordingFormDialog(QDialog):
         archival_layout.addRow("Type", self.type_edit)
         archival_layout.addRow("Generation", self.generation_edit)
         archival_layout.addRow("Quality", self.quality_edit)
+        archival_layout.addRow("Trade Status", self.trade_status_edit)
         archival_layout.addRow("Audio Source", self.audio_source_edit)
         archival_layout.addRow("Video Source", self.video_source_edit)
         archival_layout.addRow("Master", self.master_edit)
@@ -269,6 +277,7 @@ class _ExportRecordingFormDialog(QDialog):
             type=self.type_edit.currentText().strip() or None,
             generation=self.generation_edit.text().strip() or None,
             quality=self.quality_edit.currentText().strip() or None,
+            trade_status=self.trade_status_edit.currentText().strip() or None,
             audio_source=self.audio_source_edit.text().strip() or None,
             video_source=self.video_source_edit.text().strip() or None,
             master=self.master_edit.currentText() or "Unknown",

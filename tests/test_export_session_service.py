@@ -321,6 +321,83 @@ class TestProbeRecordingFromPath:
 
 
 # ---------------------------------------------------------------------------
+# probe_audio_recording_from_path
+# ---------------------------------------------------------------------------
+
+class TestProbeAudioRecordingFromPath:
+    """Audio single-file and album-folder probing (never adds)."""
+
+    def test_single_file_becomes_single_track_entry(self, tmp_path: Path) -> None:
+        track = tmp_path / "01 - song.mp3"
+        track.write_bytes(b"\x00" * 64)
+
+        svc = ExportSessionService(_make_layout())
+        with patch(
+            "bootleg_catalog.core.export_session_service.probe",
+            return_value=_make_probe_result(duration=180.0),
+        ):
+            rec = svc.probe_audio_recording_from_path(track)
+
+        assert rec.is_audio is True
+        assert rec.tracks == (str(track.resolve()),)
+        assert rec.source_path == str(track.resolve())
+        assert rec.duration == 180.0
+        assert rec.extension == ".mp3"
+        assert svc.session.recording_count == 0  # NOT added
+
+    def test_folder_album_sums_durations_and_lists_sorted_tracks(
+        self, tmp_path: Path,
+    ) -> None:
+        album = tmp_path / "album"
+        album.mkdir()
+        # Deliberately unsorted on disk; "10" must come after "02"
+        # (natural, not lexicographic, digit ordering).
+        for name in ("02 - middle.mp3", "10 - last.mp3", "01 - first.mp3"):
+            (album / name).write_bytes(b"\x00" * 10)
+
+        durations = {
+            "01 - first.mp3": 100.0,
+            "02 - middle.mp3": 150.0,
+            "10 - last.mp3": 200.0,
+        }
+
+        def fake_probe(path, **kwargs):
+            return _make_probe_result(duration=durations[Path(path).name])
+
+        svc = ExportSessionService(_make_layout())
+        with patch(
+            "bootleg_catalog.core.export_session_service.probe",
+            side_effect=fake_probe,
+        ):
+            rec = svc.probe_audio_recording_from_path(album)
+
+        assert rec.is_audio is True
+        expected_tracks = tuple(
+            str((album / name).resolve())
+            for name in ("01 - first.mp3", "02 - middle.mp3", "10 - last.mp3")
+        )
+        assert rec.tracks == expected_tracks
+        assert rec.duration == 450.0  # 100 + 150 + 200
+        assert rec.source_path == str(album.resolve())
+        assert rec.extension == ""
+        assert svc.session.recording_count == 0  # NOT added
+
+    def test_folder_without_audio_files_raises(self, tmp_path: Path) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        texty = tmp_path / "texty"
+        texty.mkdir()
+        (texty / "notes.txt").write_text("not audio", encoding="utf-8")
+
+        svc = ExportSessionService(_make_layout())
+        with pytest.raises(ExportSessionServiceError, match="No audio files"):
+            svc.probe_audio_recording_from_path(empty)
+        with pytest.raises(ExportSessionServiceError, match="No audio files"):
+            svc.probe_audio_recording_from_path(texty)
+        assert svc.session.recording_count == 0
+
+
+# ---------------------------------------------------------------------------
 # remove_recording
 # ---------------------------------------------------------------------------
 

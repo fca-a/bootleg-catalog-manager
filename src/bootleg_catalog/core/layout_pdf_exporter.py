@@ -25,18 +25,21 @@ from fpdf import FPDF
 
 try:
     # Optional accelerator: reads a font's real family name from its
-    # name table.  Never a hard dependency — the exporter falls back to
-    # a filename heuristic when it is absent.
+    # name table, and enumerates the subfonts inside a .ttc
+    # collection.  Never a hard dependency — the exporter falls back
+    # to a filename heuristic when it is absent, and skips .ttc files
+    # entirely (with a warning).
+    from fontTools.ttLib import TTCollection as _TTCollection
     from fontTools.ttLib import TTFont as _TTFont
+    from fontTools.varLib.instancer import (
+        instantiateVariableFont as _instantiateVariableFont,
+    )
 except ImportError:  # pragma: no cover - depends on the environment
+    _TTCollection = None
     _TTFont = None
+    _instantiateVariableFont = None
 
 from bootleg_catalog.core.field_resolver import FieldResolver, ResolvedLine
-from bootleg_catalog.core.layout_service import (
-    GridCell,
-    ScreenshotLayout,
-    compute_grid,
-)
 from bootleg_catalog.core.layout_text import parse_layout_lines
 from bootleg_catalog.models.export_recording import ExportRecording
 from bootleg_catalog.models.layout_model import (
@@ -236,6 +239,14 @@ class _LayoutPDF(FPDF):
         self._margin_bottom_mm = margin_bottom
         self._margin_left_mm = margin_left
 
+        # Optional background fills (None = no fill): the whole page,
+        # the body content area, and the header/footer bands, painted
+        # by _paint_backgrounds() at the start of every page.
+        self.page_background_color = page_config.page_background_color
+        self.header_background_color = page_config.header_background_color
+        self.footer_background_color = page_config.footer_background_color
+        self.body_background_color = page_config.body_background_color
+
         # width_mm/height_mm already encode the orientation (derived from
         # page_size + orientation), so a fixed "P" keeps the tuple as-is.
         super().__init__(
@@ -260,6 +271,10 @@ class _LayoutPDF(FPDF):
 
     def header(self) -> None:
         self._header_draws += 1
+        # Every page's background fills paint here, before any content
+        # and before the header row (or its early returns) — fpdf fires
+        # header() at the start of every add_page().
+        self._paint_backgrounds()
         if not self.header_texts_any:
             return
         if self.header_scope == "first" and self.page_no() > 1:
@@ -273,6 +288,52 @@ class _LayoutPDF(FPDF):
         self._draw_slot_row(
             self.header_texts, y_center_mm=self._margin_top_mm / 2
         )
+
+    def _paint_backgrounds(self) -> None:
+        """Fill the page, body area, and header/footer bands.
+
+        Called once per page from :meth:`header`.  Draw order is page →
+        body area → header band → footer band, so each later fill paints
+        over the earlier ones and the narrower bands win where they
+        overlap; the fill colour is reset to white afterwards so no
+        later rect (highlight, screenshot fill) can inherit it.  Rects
+        never move the fpdf cursor, so painting cannot shift content.
+        """
+        painted = False
+        page_rgb = _hex_to_rgb(self.page_background_color)
+        if page_rgb is not None:
+            self.set_fill_color(*page_rgb)
+            self.rect(0, 0, self.w, self.h, style="F")
+            painted = True
+        body_rgb = _hex_to_rgb(self.body_background_color)
+        if body_rgb is not None:
+            self.set_fill_color(*body_rgb)
+            self.rect(
+                self._margin_left_mm,
+                self._margin_top_mm,
+                self.w - self._margin_left_mm - self._margin_right_mm,
+                self.h - self._margin_top_mm - self._margin_bottom_mm,
+                style="F",
+            )
+            painted = True
+        header_rgb = _hex_to_rgb(self.header_background_color)
+        if header_rgb is not None:
+            self.set_fill_color(*header_rgb)
+            self.rect(0, 0, self.w, self._margin_top_mm, style="F")
+            painted = True
+        footer_rgb = _hex_to_rgb(self.footer_background_color)
+        if footer_rgb is not None:
+            self.set_fill_color(*footer_rgb)
+            self.rect(
+                0,
+                self.h - self._margin_bottom_mm,
+                self.w,
+                self._margin_bottom_mm,
+                style="F",
+            )
+            painted = True
+        if painted:
+            self.set_fill_color(255, 255, 255)
 
     def footer(self) -> None:
         self._footer_draws += 1
@@ -371,17 +432,31 @@ class _LayoutPDF(FPDF):
 def _validate_screenshots(
     screenshot_paths_by_recording: dict[str, list[str]],
 ) -> None:
-    """Raise LayoutPDFExportError if any screenshot file is missing."""
+    """Raise LayoutPDFExportError for missing or unreadable screenshots.
+
+    Missing files are collected and reported together; an existing but
+    corrupt image raises through :func:`_image_dimensions`, whose
+    LayoutPDFExportError names the file ("not a valid image") — the
+    "Bug A" guarantee that every mapped screenshot is a usable image.
+    That check used to happen implicitly, because the pre-token pass
+    opened every mapped file while drawing; it now runs up front,
+    since screenshots only draw at ``[Screenshot:N]`` positions.
+    """
     missing: list[str] = []
+    existing: list[Path] = []
     for paths in screenshot_paths_by_recording.values():
         for p in paths:
             if not Path(p).is_file():
                 missing.append(p)
+            else:
+                existing.append(Path(p))
     if missing:
         names = "\n".join(f"  {p}" for p in missing)
         raise LayoutPDFExportError(
             f"Screenshot file(s) not found ({len(missing)}):\n{names}"
         )
+    for p in existing:
+        _image_dimensions(p)
 
 
 def _validate_destination(path: Path) -> None:
@@ -475,34 +550,6 @@ def _image_dimensions(path: Path) -> tuple[int, int]:
         raise LayoutPDFExportError(
             f"Screenshot file is not a valid image: {path}\n{exc}"
         ) from exc
-
-
-def _fit_image(
-    img_w: int, img_h: int, max_w: float, max_h: float
-) -> tuple[float, float]:
-    """Scale image to fit within max_w × max_h, preserving aspect ratio."""
-    if img_w <= 0 or img_h <= 0:
-        return max_w, max_h
-    scale = min(max_w / img_w, max_h / img_h)
-    if scale >= 1.0:
-        return float(img_w), float(img_h)
-    return img_w * scale, img_h * scale
-
-
-def _compute_row_max_heights(
-    cells: list[GridCell],
-    cell_w: float,
-    max_h: float,
-) -> dict[int, float]:
-    """Compute the maximum scaled height per row across all cells."""
-    row_heights: dict[int, float] = {}
-    for cell in cells:
-        img_w, img_h = _image_dimensions(Path(cell.screenshot_path))
-        _, scaled_h = _fit_image(img_w, img_h, cell_w, max_h)
-        prev = row_heights.get(cell.row, 0.0)
-        if scaled_h > prev:
-            row_heights[cell.row] = scaled_h
-    return row_heights
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +836,25 @@ def _shot_block_x(
     return margin_left
 
 
+def _draw_shot_background(
+    pdf, screenshot_config, x: float, y: float, img_w: float, img_h: float,
+) -> None:
+    """Fill the image's bounding box behind it when a colour is set.
+
+    The rect grows by half the border width on every side so the fill
+    reaches behind the centred stroke as well; the fill colour is
+    reset to white afterwards so no later rect can inherit it.  A
+    ``None``/invalid ``background_color`` draws nothing.
+    """
+    rgb = _hex_to_rgb(getattr(screenshot_config, "background_color", None))
+    if rgb is None:
+        return
+    grow = screenshot_config.border_width_px * 25.4 / 96.0 / 2.0
+    pdf.set_fill_color(*rgb)
+    pdf.rect(x - grow, y - grow, img_w + 2 * grow, img_h + 2 * grow, style="F")
+    pdf.set_fill_color(255, 255, 255)
+
+
 def _draw_shot_border(
     pdf, screenshot_config, x: float, y: float, img_w: float, img_h: float,
 ) -> None:
@@ -890,6 +956,7 @@ def _render_screenshot_block(
         origin_x = _shot_block_x(screenshot_config, margin_left, usable_w, block_w)
         for col, (path, sw, sh) in enumerate(sizes):
             x = origin_x + col * (cell_w + spacing_mm)
+            _draw_shot_background(pdf, screenshot_config, x, y, sw, sh)
             _draw_shot_border(pdf, screenshot_config, x, y, sw, sh)
             pdf.image(path, x=x, y=y, w=sw)
         final_y = y + row_h + spacing_mm
@@ -911,17 +978,29 @@ _FONT_CACHE: dict[str, tuple[Path, str] | None] = {}
 
 
 def _font_search_dirs() -> tuple[tuple[Path, bool], ...]:
-    """(directory, recursive) pairs scanned for ``*.ttf`` on this OS.
+    """(directory, recursive) pairs scanned for font files on this OS.
 
-    Windows keeps its fonts flat in ``%WINDIR%\\Fonts``; macOS splits
-    them between ``/Library/Fonts`` (admin-installed) and
-    ``/System/Library/Fonts`` (system), both walked recursively to
-    catch subdirectories; Linux distributions install under
-    ``/usr/share/fonts`` in per-package trees, also recursive.
+    Windows is searched per-user FIRST: fonts installed "for me only"
+    live under ``%LOCALAPPDATA%\\Microsoft\\Windows\\Fonts`` while the
+    system-wide collection sits under ``%WINDIR%\\Fonts``, so a
+    per-user install shadows the system copy of the same family.  A
+    missing directory — or an unset ``LOCALAPPDATA`` — is skipped
+    silently.  macOS splits its fonts between ``/Library/Fonts``
+    (admin-installed) and ``/System/Library/Fonts`` (system), both
+    walked recursively to catch subdirectories; Linux distributions
+    install under ``/usr/share/fonts`` in per-package trees, also
+    recursive.
     """
     if sys.platform == "win32":
         windir = Path(os.environ.get("WINDIR", r"C:\Windows"))
-        return ((windir / "Fonts", False),)
+        localappdata = os.environ.get("LOCALAPPDATA")
+        dirs: list[tuple[Path, bool]] = []
+        if localappdata:
+            dirs.append(
+                (Path(localappdata) / "Microsoft" / "Windows" / "Fonts", False)
+            )
+        dirs.append((windir / "Fonts", False))
+        return tuple(dirs)
     if sys.platform == "darwin":
         return (
             (Path("/Library/Fonts"), True),
@@ -952,6 +1031,58 @@ def _read_tt_names(path: Path) -> tuple[str | None, str | None]:
                 font.close()
             except Exception:
                 pass
+
+
+def _match_ttc_subfont(path: Path, family: str) -> int | None:
+    """Index of the subfont in collection *path* matching *family*.
+
+    A subfont matches when its name-table family (ID 16, falling back
+    to ID 1) equals *family* case-insensitively — the ``Regular``
+    subfamily preferred when several faces share the family, the same
+    rule :func:`_match_family` applies across files — or when the
+    Windows "Family Subfamily" composite ``"{family} {subfamily}"``
+    equals it, which is how ``"Yu Gothic Medium"`` reaches the
+    ``"Yu Gothic"``/``"Medium"`` subfont of ``YuGothM.ttc`` (likewise
+    Semibold, Bold, Light, Regular, Italic, Bold Italic, and any other
+    subfamily — the composite rule is generic, not a hardcoded list).
+
+    Requires fontTools' ``TTCollection``; any parse failure returns
+    ``None`` (the caller moves on to the next file).
+    """
+    if _TTCollection is None:
+        return None
+    target = family.lower()
+    collection = None
+    try:
+        collection = _TTCollection(str(path), lazy=True)
+        family_first: int | None = None
+        composite_first: int | None = None
+        for index, font in enumerate(collection.fonts):
+            name_table = font["name"]
+            name_family = (
+                name_table.getDebugName(16) or name_table.getDebugName(1)
+            )
+            if not name_family:
+                continue
+            subfamily = str(name_table.getDebugName(2) or "")
+            if str(name_family).lower() == target:
+                if subfamily.lower() == "regular":
+                    return index
+                if family_first is None:
+                    family_first = index
+            elif f"{name_family} {subfamily}".strip().lower() == target:
+                if composite_first is None:
+                    composite_first = index
+        return family_first if family_first is not None else composite_first
+    except Exception:
+        return None
+    finally:
+        if collection is not None:
+            for font in getattr(collection, "fonts", []):
+                try:
+                    font.close()
+                except Exception:
+                    pass
 
 
 def _match_family(files: list[Path], family: str) -> Path | None:
@@ -994,14 +1125,188 @@ def _match_family(files: list[Path], family: str) -> Path | None:
     return None
 
 
+_INSTANCE_DIR: Path | None = None
+
+
+def _instance_dir() -> Path:
+    """Lazily-created session temp dir holding instanced variable fonts.
+
+    The static ``.ttf`` files written here outlive a single export (the
+    resolver caches their paths), so they live for the whole process.
+    """
+    global _INSTANCE_DIR
+    if _INSTANCE_DIR is None:
+        _INSTANCE_DIR = Path(tempfile.mkdtemp(prefix="bcm-varfont-"))
+    return _INSTANCE_DIR
+
+
+def _read_variable_info(
+    path: Path,
+) -> tuple[str, str, dict[str, dict[str, float]], dict[str, float]] | None:
+    """Inspect a variable font (``fvar`` table) for name-based matching.
+
+    Returns ``(base_family, subfamily, named_instances,
+    default_coords)``: ``base_family`` is name-ID 16 falling back to 1
+    (e.g. ``"Manrope"`` or ``"Google Sans"`` — neither file lists the
+    weight in its base family); ``subfamily`` is name-ID 2 (e.g.
+    ``"Italic"`` on the Google Sans italic file, which shares the
+    ``"Google Sans"`` base family and must not win a bare-family
+    match); ``named_instances`` maps each ``fvar`` instance name (from
+    the name table) to its full axis coordinates (e.g. ``"Medium"`` →
+    ``{"wght": 500, ...}``); ``default_coords`` is every axis'
+    ``defaultValue`` (the values fpdf2 would embed unchanged).
+
+    Returns ``None`` for a static font (no ``fvar``) or when the file
+    cannot be parsed.  Requires fontTools.
+    """
+    if _TTFont is None:
+        return None
+    font = None
+    try:
+        font = _TTFont(str(path), lazy=True)
+        if "fvar" not in font:
+            return None
+        name_table = font["name"]
+        base = name_table.getDebugName(16) or name_table.getDebugName(1)
+        if not base:
+            return None
+        subfamily = str(name_table.getDebugName(2) or "")
+        fvar = font["fvar"]
+        default_coords = {a.axisTag: a.defaultValue for a in fvar.axes}
+        instances: dict[str, dict[str, float]] = {}
+        for inst in fvar.instances:
+            inst_name = name_table.getDebugName(inst.subfamilyNameID)
+            if inst_name:
+                instances[str(inst_name)] = dict(inst.coordinates)
+        return str(base), subfamily, instances, default_coords
+    except Exception:
+        return None
+    finally:
+        if font is not None:
+            try:
+                font.close()
+            except Exception:
+                pass
+
+
+def _instance_variable_font(
+    path: Path, coords: dict[str, float], base_family: str, instance_name: str,
+) -> Path | None:
+    """Pin *coords* on the variable font *path*; return a static ``.ttf``.
+
+    fpdf2 embeds a variable font at its default axis values (verified
+    against ``add_font``: it accepts the file, but the ``wght`` default
+    — e.g. 200 for Manrope, 400 for Google Sans — is what gets drawn),
+    so a request for Medium would render Regular/ExtraLight.  Pinning
+    the axes with fontTools' ``instantiateVariableFont`` bakes the
+    requested instance into a static face fpdf2 renders correctly.
+    The result lands in :func:`_instance_dir` and is returned as the
+    resolved path.
+    """
+    if _instantiateVariableFont is None or _TTFont is None:
+        return None
+    font = None
+    try:
+        font = _TTFont(str(path))
+        static = _instantiateVariableFont(font, coords)
+        safe = re.sub(
+            r"[^A-Za-z0-9._-]", "_", f"{base_family}-{instance_name}",
+        )
+        dest = _instance_dir() / f"{safe}.ttf"
+        static.save(str(dest))
+        return dest
+    except Exception:
+        get_logger().warning(
+            f'Variable font "{base_family}" could not be instanced from '
+            f"{path}; falling back to the raw file (default weight)."
+        )
+        return None
+    finally:
+        if font is not None:
+            try:
+                font.close()
+            except Exception:
+                pass
+
+
+def _resolve_ttf(files: list[Path], family: str) -> Path | None:
+    """Match *family* across *files*, instancing variable fonts first.
+
+    A variable font (one with an ``fvar`` table) matches when the
+    request equals its base family — the Regular named instance is
+    used, since a bare family name conventionally means Regular — or
+    equals the composite ``"{base_family} {instance}"``, which is how
+    ``"Google Sans Medium"`` reaches the Medium instance of Google
+    Sans.  The name-table-only matcher cannot see that name at all:
+    Google Sans lists just ``Google Sans``/``Regular`` in its name
+    table (no name-ID 16/17), so the instance names in ``fvar`` are
+    the only place ``Medium`` exists.  A matched variable font is
+    pinned to the instance's coordinates and returned as a static
+    ``.ttf`` (:func:`_instance_variable_font`); if instancing fails the
+    raw file is returned by the static pass below (wrong weight, but
+    it embeds).  Static files fall through to the exact
+    :func:`_match_family` rule unchanged.
+    """
+    target = family.lower()
+    if _TTFont is not None:
+        for path in files:
+            info = _read_variable_info(path)
+            if info is None:
+                continue
+            base, subfamily, instances, default_coords = info
+            coords: dict[str, float] | None = None
+            instance_name = "Default"
+            if base.lower() == target:
+                # A bare family request means the upright face; an
+                # italic file (same base family, e.g. Google Sans
+                # italic) must not win it — composites are unaffected
+                # because their instance names carry the " Italic"
+                # suffix and never equal a plain weight name.
+                if "italic" in subfamily.lower() and "italic" not in target:
+                    continue
+                instance_name = "Regular" if "Regular" in instances else "Default"
+                coords = instances.get("Regular", default_coords)
+            else:
+                for inst_name, inst_coords in instances.items():
+                    if f"{base} {inst_name}".lower() == target:
+                        instance_name = inst_name
+                        coords = inst_coords
+                        break
+            if coords is None:
+                continue
+            static = _instance_variable_font(
+                path, coords, base, instance_name,
+            )
+            if static is not None:
+                return static
+    return _match_family(files, family)
+
+
 def _resolve_font(family_name: str) -> tuple[Path, str] | None:
-    """Return ``(ttf_path, family_name_for_fpdf)`` if the font can be
+    """Return ``(font_path, family_name_for_fpdf)`` if the font can be
     found on this system, or ``None`` if it cannot.
 
     Callers must fall back to Helvetica on ``None``.  ``"Helvetica"``
     itself never resolves: it is an fpdf built-in core font, never a
-    TTF file on disk.  Results (including misses) are cached per
+    font file on disk.  Results (including misses) are cached per
     family name.
+
+    Each search directory (per-user then system-wide on Windows, see
+    :func:`_font_search_dirs`) is globbed for BOTH ``*.ttf`` files and
+    ``*.ttc`` TrueType Collections.  Plain TTFs match by the filename
+    heuristic or the fontTools name table; a variable TTF (with an
+    ``fvar`` table) additionally matches its base family or the
+    composite ``"{base} {instance}"`` (e.g. ``"Google Sans Medium"``)
+    and is pinned to a static ``.ttf`` at that instance's weight
+    (:func:`_resolve_ttf`) — fpdf2 would otherwise embed it at the
+    default axis values.  A ``.ttc`` is opened with fontTools'
+    ``TTCollection`` and matched subfont by subfont
+    (:func:`_match_ttc_subfont`); fpdf2 accepts a collection path
+    directly (verified against fpdf2's ``add_font``), so the resolver
+    returns the ``.ttc`` file itself and no extraction happens.
+    Without fontTools the collections cannot be parsed and are skipped
+    with a warning.  Within one directory a TTF match wins over a TTC
+    match.
     """
     if not family_name or family_name.lower() == "helvetica":
         return None
@@ -1012,11 +1317,32 @@ def _resolve_font(family_name: str) -> tuple[Path, str] | None:
     for directory, recursive in _font_search_dirs():
         if not directory.is_dir():
             continue
-        pattern = "**/*.ttf" if recursive else "*.ttf"
-        files = sorted(p for p in directory.glob(pattern) if p.is_file())
-        match = _match_family(files, family_name)
+        star = "**/" if recursive else ""
+        ttf_files = sorted(
+            p for p in directory.glob(f"{star}*.ttf") if p.is_file()
+        )
+        match = _resolve_ttf(ttf_files, family_name)
         if match is not None:
             result = (match, family_name)
+            break
+        ttc_files = sorted(
+            p for p in directory.glob(f"{star}*.ttc") if p.is_file()
+        )
+        if not ttc_files:
+            continue
+        if _TTCollection is None:
+            get_logger().warning(
+                f'Font "{family_name}": fontTools is not available, so '
+                f".ttc collections under {directory} cannot be parsed "
+                "and are being skipped."
+            )
+            continue
+        for ttc in ttc_files:
+            if _match_ttc_subfont(ttc, family_name) is None:
+                continue
+            result = (ttc, family_name)
+            break
+        if result is not None:
             break
 
     _FONT_CACHE[family_name] = result
@@ -1054,6 +1380,44 @@ def _register_font(pdf, family_name: str, resolved, role: str) -> str:
         )
         return "Helvetica"
     return family
+
+
+def _separator_for_font(separator: str, family: str | None) -> str:
+    """Reduce *separator* to characters *family* can actually draw.
+
+    fpdf substitutes ``?`` for glyphs the active font lacks — which is
+    how the default U+2500 box-drawing separator turned into a row of
+    question marks under the built-in Helvetica (the removed pre-pass
+    did the same substitution itself via ``latin-1 errors="replace"``,
+    before fpdf ever saw the character).
+
+    Coverage rules:
+
+    - A family registered from a TTF keeps every character in that
+      font's cmap (read through fontTools when it is available), so a
+      font that really contains the box character keeps it.
+    - Anything else — the core fonts, a family that never resolved, an
+      unreadable font file, or no fontTools — is treated as latin-1
+      (fpdf's own limit for the built-ins); every other character
+      becomes ``-``.
+    """
+    if not separator:
+        return ""
+    resolved = _FONT_CACHE.get(family) if family else None
+    codepoints: set[int] | None = None
+    if resolved is not None and _TTFont is not None:
+        try:
+            font = _TTFont(str(resolved[0]), lazy=True)
+            try:
+                cmap = font.getBestCmap()
+            finally:
+                font.close()
+            codepoints = set(cmap) if cmap else None
+        except Exception:
+            codepoints = None
+    if codepoints is None:
+        return "".join(ch if ord(ch) <= 0xFF else "-" for ch in separator)
+    return "".join(ch if ord(ch) in codepoints else "-" for ch in separator)
 
 
 # ---------------------------------------------------------------------------
@@ -1128,7 +1492,6 @@ def export_layout_pdf(
         page_config.effective_margins_mm()
     )
     page_w = page_config.width_mm
-    page_h = page_config.height_mm
     usable_w = page_w - margin_left - margin_right
 
     # --- Create PDF ---
@@ -1156,21 +1519,24 @@ def export_layout_pdf(
     pdf.add_page()
 
     for section_idx, section in enumerate(document.show_sections):
-        # Page break between sections (not before the first)
+        # Sections flow continuously on the current page; there is no
+        # forced page break between them (fpdf's auto page break
+        # handles overflow).  The separator line only draws between
+        # sections.
         if section_idx > 0:
-            # Separator line — use only latin-1 safe characters
+            # Separator line — only characters the active font can
+            # really draw (U+2500 under Helvetica would print as "?";
+            # _separator_for_font maps it to "-" instead).
             if separator:
                 pdf.ln(4)
                 _apply_style(pdf, None, page_config)
-                safe_sep = separator.encode("latin-1", errors="replace").decode("latin-1")
+                safe_sep = _separator_for_font(separator, pdf.body_font)
                 pdf.cell(
                     usable_w, 6,
                     safe_sep * 60,
                     new_x="LMARGIN", new_y="NEXT",
                 )
                 pdf.ln(2)
-
-            pdf.add_page()
 
         # --- Section bookmark/outline ---
         try:
@@ -1198,26 +1564,6 @@ def export_layout_pdf(
                     screenshot_config=screenshot_config,
                 )
 
-            # --- Screenshots ---
-            if (
-                screenshot_paths_by_recording is not None
-                and screenshot_config.enabled
-            ):
-                src_path = resolved_rec.recording.source_path
-                screenshots = screenshot_paths_by_recording.get(src_path, [])
-                if screenshots:
-                    pdf.ln(2)
-                    _render_screenshots(
-                        pdf,
-                        screenshots,
-                        usable_w,
-                        page_w,
-                        page_h,
-                        margin_left,
-                        margin_bottom,
-                        screenshot_config,
-                    )
-
     # --- Write to temp then move ---
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1242,68 +1588,3 @@ def export_layout_pdf(
         ) from exc
 
     return output.resolve()
-
-
-# ---------------------------------------------------------------------------
-# Screenshot rendering
-# ---------------------------------------------------------------------------
-
-def _render_screenshots(
-    pdf,
-    screenshot_paths: list[str],
-    usable_w: float,
-    page_w: float,
-    page_h: float,
-    margin_left: float,
-    margin_bottom: float,
-    screenshot_config,
-) -> None:
-    """Render a list of screenshot images in a grid/row.
-
-    L15.9.3: the gap comes from ``spacing_px``, a ``border_width_px >
-    0`` strokes a rectangle behind every image, and ``align`` shifts
-    the block within the content column.  fpdf2 cannot draw rounded
-    rectangles, so ``corner_radius_px`` falls back to a square rect.
-    """
-    # Build grid cells
-    photos_per_row = (
-        3 if screenshot_config.layout == "grid" else len(screenshot_paths)
-    )
-    layout = ScreenshotLayout(photos_per_row=photos_per_row)
-    cells = compute_grid(screenshot_paths, layout)
-    if not cells:
-        return
-
-    spacing = _shot_spacing_mm(screenshot_config)  # mm between images
-    cols = photos_per_row
-    cell_w = (usable_w - spacing * (cols - 1)) / cols
-    max_h = screenshot_config.max_height_px * 0.264583  # px → mm @ 96 dpi
-
-    # Pre-compute the tallest scaled image per row
-    row_heights = _compute_row_max_heights(cells, cell_w, max_h)
-
-    for cell in cells:
-        img_path = Path(cell.screenshot_path)
-        img_w, img_h = _image_dimensions(img_path)
-        scaled_w, scaled_h = _fit_image(img_w, img_h, cell_w, max_h)
-
-        row_h = row_heights[cell.row]
-        needed = row_h + spacing
-
-        # Page break check
-        if pdf.get_y() + needed > page_h - margin_bottom:
-            pdf.add_page()
-
-        # The last grid row may be partial; align against what it holds.
-        row_cells = [c for c in cells if c.row == cell.row]
-        block_w = len(row_cells) * cell_w + (len(row_cells) - 1) * spacing
-        origin_x = _shot_block_x(screenshot_config, margin_left, usable_w, block_w)
-        x = origin_x + cell.col * (cell_w + spacing)
-        y = pdf.get_y()
-
-        _draw_shot_border(pdf, screenshot_config, x, y, scaled_w, scaled_h)
-        pdf.image(str(img_path), x=x, y=y, w=scaled_w, h=scaled_h)
-
-        # After last column in row, advance Y
-        if cell.col == cols - 1 or cell == cells[-1]:
-            pdf.set_y(y + row_h + spacing)

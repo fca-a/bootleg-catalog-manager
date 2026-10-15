@@ -46,6 +46,15 @@ class ExportRecording:
     audio_sample_rate: int | None = None
     audio_bitrate: int | None = None
 
+    # --- Audio (is_audio entries only) ---
+    # True for entries added via "+ Add Audio Recording…": the source
+    # is an audio file or a folder of tracks (an album), never video.
+    is_audio: bool = False
+    # Audio files backing this entry: (source_path,) for a single
+    # file, every audio file inside the folder for an album.  Always
+    # empty when is_audio is False (validated in __post_init__).
+    tracks: tuple[str, ...] = ()
+
     # --- Archival (user-populated) ---
     title: str | None = None
     year: int | None = None
@@ -59,6 +68,9 @@ class ExportRecording:
     type: str | None = None
     generation: str | None = None
     quality: str | None = None
+    # Free text; NFT (Not For Trade) / NFTF (Not For Trade Forever) are
+    # the default suggestions (see settings_service).
+    trade_status: str | None = None
     audio_source: str | None = None
     video_source: str | None = None
     master: str | None = None
@@ -84,7 +96,7 @@ class ExportRecording:
     screenshot_split: int | None = None
 
     def __post_init__(self) -> None:
-        """Normalise and validate the multi-part ``parts`` tuple."""
+        """Normalise ``parts``/``tracks`` and validate their invariants."""
         parts = tuple(self.parts)
         if len(parts) >= 3:
             raise ValueError("At most two parts are supported")
@@ -96,6 +108,14 @@ class ExportRecording:
                 f"{parts[0]!r} != {self.source_path!r}"
             )
         self.parts = parts
+
+        # Audio: tracks list the album's files and only make sense for
+        # audio entries — a video recording must never carry them.
+        self.tracks = tuple(self.tracks)
+        if not self.is_audio and self.tracks:
+            raise ValueError(
+                "tracks can only be populated when is_audio is True"
+            )
 
         if self.screenshot_split is not None:
             count = len(self.screenshot_paths)

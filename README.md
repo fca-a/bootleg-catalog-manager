@@ -24,10 +24,13 @@ application never modifies your media files.
 - Layout templates with `{TechnicalField}` and `[ArchivalField]` markers
 - Header and footer bands with text and optional logo images
 - Page setup: A4 / Letter / A3, portrait / landscape, custom margins
+- Configurable background colors for the page, header, footer, body, and screenshots in PDF exports
 - Inline formatting in layouts: bold, italic, highlight, text color
 - `[Screenshot:N]` layout token to place N screenshots at any position
 - Import a folder as a single rip entry (`VIDEO_TS` / `BDMV` folder detection)
 - Multi-part recordings: combine up to two files into one entry
+- Catalog audio recordings — either a single file or an album folder treated as one entry
+- A free-text Trade Status field (`[Trade Status]`) with default suggestions for NFT and NFTF
 - Editable suggestion lists for the Type / Source / Quality fields in settings
 
 ## Requirements

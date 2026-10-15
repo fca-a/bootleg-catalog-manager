@@ -16,6 +16,7 @@ from PySide6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -80,6 +81,73 @@ def _plural(count: int, singular: str, plural: str) -> str:
     return singular if count == 1 else plural
 
 
+#: File-dialog filter for "+ Add Audio Recording…" single-file mode
+#: (mirrors the video filter on _on_add_recording's picker).
+_AUDIO_FILE_FILTER = (
+    "Audio files (*.mp3 *.flac *.m4a *.aac *.ogg *.opus *.wav *.wma "
+    "*.aiff *.ape *.alac);;All files (*)"
+)
+
+
+class AddMediaSourceDialog(QDialog):
+    """Ask whether a new recording comes from a single file or a folder.
+
+    Shared by "+ Add Video Recording…" and "+ Add Audio Recording…";
+    *kind* only decides the wording — and that video's folder pick is
+    the rip scanner.  :attr:`result_choice` returns ``"file"`` or
+    ``"folder"`` after ``Accepted`` and ``None`` otherwise, mirroring
+    :class:`RipMetadataDialog`'s result-accessor style.
+    """
+
+    def __init__(self, kind: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._kind = kind
+        self._choice: str | None = None
+        self.setWindowTitle(f"Add {kind} recording")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(
+            QLabel(
+                f"Add a {kind} recording from a single file or a folder.",
+                self,
+            ),
+        )
+
+        self._buttons = QDialogButtonBox(parent=self)
+        file_btn = self._buttons.addButton(
+            "Single file\u2026",
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        folder_label = "Rip Folder\u2026" if kind == "video" else "Folder\u2026"
+        folder_btn = self._buttons.addButton(
+            folder_label,
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
+        self._buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        # One click = one decision: the choice is recorded and the
+        # dialog accepted right away, so ``accepted`` needs no wiring.
+        file_btn.clicked.connect(
+            lambda _checked=False: self._choose("file"),
+        )
+        folder_btn.clicked.connect(
+            lambda _checked=False: self._choose("folder"),
+        )
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+    def _choose(self, choice: str) -> None:
+        """Record the pick and accept."""
+        self._choice = choice
+        self.accept()
+
+    @property
+    def result_choice(self) -> str | None:
+        """``"file"``/``"folder"`` after ``Accepted``; ``None`` otherwise."""
+        if self.result() != QDialog.DialogCode.Accepted:
+            return None
+        return self._choice
+
+
 class ExportPreviewWindow(QMainWindow):
     """Main window for previewing and exporting an export session.
 
@@ -140,9 +208,13 @@ class ExportPreviewWindow(QMainWindow):
         # --- Toolbar ---
         toolbar = QHBoxLayout()
 
-        self._add_btn = QPushButton("+ Add Recording\u2026")
-        self._add_btn.clicked.connect(self._on_add_recording)
+        self._add_btn = QPushButton("+ Add Video Recording\u2026")
+        self._add_btn.clicked.connect(self._on_add_video_recording)
         toolbar.addWidget(self._add_btn)
+
+        self._add_audio_btn = QPushButton("+ Add Audio Recording\u2026")
+        self._add_audio_btn.clicked.connect(self._on_add_audio_recording)
+        toolbar.addWidget(self._add_audio_btn)
 
         self._add_folder_btn = QPushButton("+ Add from Folder\u2026")
         self._add_folder_btn.clicked.connect(self._on_add_from_folder)
@@ -341,6 +413,17 @@ class ExportPreviewWindow(QMainWindow):
             paths.update(rec.manual_paths)
         return paths
 
+    def _all_screenshot_paths(self) -> set[str]:
+        """Union of every screenshot path (manual and auto) across recordings.
+
+        Passed as ``embed_paths`` when the user opts to embed all
+        screenshots, making the ``.bootleg`` self-contained.
+        """
+        paths: set[str] = set()
+        for rec in self._service.session.recordings:
+            paths.update(rec.screenshot_paths)
+        return paths
+
     def _on_save(self) -> None:
         """Save to the current path, falling through to Save As if none."""
         if self._current_path is None:
@@ -383,8 +466,35 @@ class ExportPreviewWindow(QMainWindow):
             self._service.set_display_name(name.strip())
             self._update_title()
 
+        # Ask whether to embed every screenshot (self-contained file) or
+        # keep the current behaviour (embed only manual attachments and
+        # reference the auto sidecars by path).
+        embed_reply = QMessageBox.question(
+            self,
+            "Embed Screenshots",
+            "Embed all screenshots in the session file?\n\n"
+            "Embedding makes the .bootleg self-contained, but the file "
+            "can grow significantly if the session has many "
+            "screenshots.\n\n"
+            "If you choose No, screenshots are referenced by their "
+            "current paths. They will be lost if the original files "
+            "move or if the application cache is cleared.",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if embed_reply == QMessageBox.StandardButton.Cancel:
+            return  # cancelled — no file written, _current_path unchanged
+        if embed_reply == QMessageBox.StandardButton.Yes:
+            embed_paths = self._all_screenshot_paths()
+        else:
+            # No: keep the existing behaviour — embed only the manually
+            # attached screenshots, reference the auto sidecars.
+            embed_paths = self._manual_screenshot_paths()
+
         try:
-            self._service.save(path, embed_paths=self._manual_screenshot_paths())
+            self._service.save(path, embed_paths=embed_paths)
         except SessionStoreError as exc:
             QMessageBox.warning(self, "Save Error", str(exc))
             return  # _current_path unchanged
@@ -597,6 +707,55 @@ class ExportPreviewWindow(QMainWindow):
             "To add more, create separate recordings.",
         )
 
+    # -- Add Video / Audio routing ------------------------------------------
+
+    def _on_add_video_recording(self) -> None:
+        """File or folder?  Route to the existing video flows unchanged."""
+        choice = self._ask_media_source("video")
+        if choice == "file":
+            self._on_add_recording()
+        elif choice == "folder":
+            self._on_add_from_folder()
+
+    def _on_add_audio_recording(self) -> None:
+        """File or folder?  Probe audio, then run the shared add dialog.
+
+        The probe runs synchronously — one pass per track at most — and
+        failures (missing path, no audio files) surface as a warning
+        instead of escaping the Qt slot.
+        """
+        choice = self._ask_media_source("audio")
+        if choice == "file":
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Audio File",
+                "",
+                _AUDIO_FILE_FILTER,
+            )
+        elif choice == "folder":
+            path = QFileDialog.getExistingDirectory(
+                self,
+                "Select Album Folder",
+                "",
+            )
+        else:
+            return  # cancelled: result_choice is None
+        if not path:
+            return
+        try:
+            recording = self._service.probe_audio_recording_from_path(path)
+        except ExportSessionServiceError as exc:
+            QMessageBox.warning(self, "Audio Probe Error", str(exc))
+            return
+        self._show_add_dialog(recording)
+
+    def _ask_media_source(self, kind: str) -> str | None:
+        """Open the file-or-folder chooser for *kind*; ``None`` on cancel."""
+        dialog = AddMediaSourceDialog(kind, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.result_choice
+
     def _start_background_probe(self, path: str) -> None:
         """Probe *path* on a worker thread; results arrive via slots.
 
@@ -624,6 +783,14 @@ class ExportPreviewWindow(QMainWindow):
     def _on_probe_finished(self, recording: ExportRecording) -> None:
         """Probe succeeded: run the add dialog on the main thread."""
         self._set_busy(None)
+        self._show_add_dialog(recording)
+
+    def _show_add_dialog(self, recording: ExportRecording) -> None:
+        """Open AddRecordingDialog for an already-probed recording.
+
+        Accepted → commit through the service (dirty flag set); rejected
+        → the recording is NOT added.  Either way the preview refreshes.
+        """
         settings = load_settings()
         dialog = AddRecordingDialog(recording, settings, parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:

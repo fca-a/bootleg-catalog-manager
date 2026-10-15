@@ -114,18 +114,26 @@ class _SyncQThread(QThread):
 
 
 class _RecordingScreenshotWorker(QObject):
-    """ScreenshotWorker double: records the call, never emits a result."""
+    """ScreenshotWorker double: records the call, never emits a result.
+
+    ``**extras`` swallows the recording-mode keywords (recording,
+    total, ffprobe_path) so the double works for both worker shapes.
+    """
 
     progress = Signal(int, int)
     finished = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, video_path, plan, ffmpeg_path, overwrite=False) -> None:
+    def __init__(self, video_path, plan, ffmpeg_path, overwrite=False,
+                 **extras) -> None:
         super().__init__()
         self.video_path = video_path
         self.plan = plan
         self.ffmpeg_path = ffmpeg_path
         self.overwrite = overwrite
+        self.recording = extras.get("recording")
+        self.total = extras.get("total")
+        self.ffprobe_path = extras.get("ffprobe_path")
         self.ran = False
 
     def moveToThread(self, thread) -> None:  # noqa: N802 (Qt API)
@@ -422,10 +430,12 @@ _SHOTS = [
 def _make_two_part_recording(
     screenshots: list[str] | None = None,
     split: int | None = None,
+    duration: float | None = None,
 ) -> ExportRecording:
     return ExportRecording(
         source_path=_PART_A,
         parts=(_PART_A, _PART_B),
+        duration=duration,
         screenshot_paths=list(screenshots or []),
         manual_paths=set(),
         screenshot_split=split,
@@ -745,3 +755,103 @@ class TestGenerateScreenshotsFlow:
         # Status cleared and the buttons unlocked again.
         assert dialog._status_label.isHidden()
         assert dialog._buttons.isEnabled()
+
+
+# ---------------------------------------------------------------------------
+# Multi-part generation (bugs A/D)
+# ---------------------------------------------------------------------------
+
+
+class TestMultipartGenerationFlow:
+    """Two-part recordings generate in random mode only."""
+
+    def test_random_mode_starts_worker_with_the_requested_total(
+        self, qt_app,
+    ) -> None:
+        """Random mode on a 2-part recording forwards the full count."""
+        rec = _make_two_part_recording(duration=7200.0)
+        dialog = ScreenshotManagerDialog(rec)
+
+        with patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "GenerateScreenshotsDialog",
+            _AcceptingGenerateDialog,  # count=3, accepts
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "load_settings",
+            return_value=AppSettings(
+                ffmpeg_path="C:/tools/ffmpeg.exe",
+                ffprobe_path="C:/tools/ffprobe.exe",
+            ),
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "ScreenshotWorker",
+            _RecordingScreenshotWorker,
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog.QThread",
+            _SyncQThread,
+        ):
+            dialog.findChild(
+                QPushButton, "generateScreenshotsButton",
+            ).click()
+
+        assert isinstance(dialog._screenshot_thread, _SyncQThread)
+        assert dialog._screenshot_thread.start_called
+        worker = dialog._screenshot_worker
+        assert worker.ran is True
+        # Recording mode: no pre-built plan; the worker receives both
+        # parts and the whole requested count (the 2+1 split happens
+        # at run time, so the plan's total equals the request).
+        assert worker.plan is None
+        assert len(worker.recording.parts) == 2
+        assert worker.total == 3
+        assert worker.ffmpeg_path == "C:/tools/ffmpeg.exe"
+        assert worker.ffprobe_path == "C:/tools/ffprobe.exe"
+
+    def test_manual_mode_is_refused_with_information_dialog(
+        self, qt_app,
+    ) -> None:
+        """Manual timestamps + 2 parts: info dialog, no worker started."""
+        rec = _make_two_part_recording(duration=7200.0)
+        dialog = ScreenshotManagerDialog(rec)
+
+        class _ManualAcceptingDialog(GenerateScreenshotsDialog):
+            """Modal double: select Manual mode and accept immediately."""
+
+            def exec(self) -> QDialog.DialogCode:  # noqa: N802 (Qt API)
+                self._manual_radio.setChecked(True)
+                self.accept()
+                return self.result()
+
+        with patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "GenerateScreenshotsDialog",
+            _ManualAcceptingDialog,
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "QMessageBox",
+        ) as mock_box, patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog."
+            "ScreenshotWorker",
+            _RecordingScreenshotWorker,
+        ), patch(
+            "bootleg_catalog.ui.dialogs.screenshot_manager_dialog.QThread",
+            _SyncQThread,
+        ):
+            dialog.findChild(
+                QPushButton, "generateScreenshotsButton",
+            ).click()
+
+        mock_box.information.assert_called_once()
+        args = mock_box.information.call_args.args
+        assert args[0] is dialog
+        assert args[1] == "Generate Screenshots"
+        assert args[2] == (
+            "Manual timestamps are not supported for multi-part "
+            "recordings. Use Auto, then adjust the resulting images "
+            "in the Screenshot Manager."
+        )
+        # No generation was started.
+        assert dialog._screenshot_worker is None
+        assert dialog._screenshot_thread is None
+        assert dialog._status_label.isHidden()

@@ -199,6 +199,22 @@ def page_size_dimensions_mm(page_size: str, orientation: str) -> tuple[float, fl
     return width_mm, height_mm
 
 
+_BG_HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+
+
+def _optional_hex(value: Any) -> str | None:
+    """Coerce a background-colour payload to ``None`` or ``"#RRGGBB"``.
+
+    ``None`` stays ``None`` and a valid six-digit hex string is kept
+    verbatim; ANY other value — a malformed colour string, a non-string
+    — falls back to ``None`` silently.  Backgrounds are decorative, so
+    a hand-edited or older payload must never raise.
+    """
+    if isinstance(value, str) and _BG_HEX_RE.match(value):
+        return value
+    return None
+
+
 @dataclass
 class PageConfig:
     """Page dimensions and fonts for PDF export.
@@ -212,6 +228,14 @@ class PageConfig:
 
     Per-side margins override the uniform ``margin_mm`` on that side;
     ``None`` falls back to ``margin_mm``.
+
+    The four optional background colours (``None`` = the exporter's
+    plain white page) paint the whole page, the header band, the footer
+    band and the body content area respectively.  Each is normalised in
+    ``__post_init__``: a valid ``"#RRGGBB"`` is kept, anything else —
+    including a non-None malformed value — falls back to ``None``
+    silently, so a hand-edited or older payload can never break
+    loading.
     """
     page_size: str = "A4"              # "A4" | "Letter" | "A3"
     orientation: str = "portrait"      # "portrait" | "landscape"
@@ -224,11 +248,19 @@ class PageConfig:
     margin_left_mm: float | None = None
     body_font: str = "Helvetica"
     header_font: str = "Helvetica"
+    page_background_color: str | None = None
+    header_background_color: str | None = None
+    footer_background_color: str | None = None
+    body_background_color: str | None = None
 
     def __post_init__(self) -> None:
         self.width_mm, self.height_mm = page_size_dimensions_mm(
             self.page_size, self.orientation
         )
+        self.page_background_color = _optional_hex(self.page_background_color)
+        self.header_background_color = _optional_hex(self.header_background_color)
+        self.footer_background_color = _optional_hex(self.footer_background_color)
+        self.body_background_color = _optional_hex(self.body_background_color)
 
     def effective_margins_mm(self) -> tuple[float, float, float, float]:
         """Return ``(top, right, bottom, left)`` effective margins in mm.
@@ -263,10 +295,12 @@ class ScreenshotConfig:
     ``__post_init__``: negative pixel counts clamp to 0, an
     ``border_color`` that is not a 6-digit hex falls back to
     ``"#CCCCCC"``, and an ``align`` outside ``left``/``center``/``right``
-    falls back to ``"left"``.  Nothing here raises, so a hand-edited or
-    older payload can never break loading.  Validation runs on
-    construction, so ``from_dict`` (and ``dataclasses.replace``) get it
-    for free.
+    falls back to ``"left"``.  ``background_color`` — the fill painted
+    behind each image — is ``None`` (no fill) or a valid ``"#RRGGBB"``
+    and falls back to ``None`` silently otherwise.  Nothing here
+    raises, so a hand-edited or older payload can never break loading.
+    Validation runs on construction, so ``from_dict`` (and
+    ``dataclasses.replace``) get it for free.
     """
     enabled: bool = True
     max_width_px: int = 200
@@ -278,6 +312,7 @@ class ScreenshotConfig:
     corner_radius_px: int = 0
     spacing_px: int = 4
     align: str = "left"
+    background_color: str | None = None
 
     _HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
     _ALIGN_VALUES = ("left", "center", "right")
@@ -290,6 +325,7 @@ class ScreenshotConfig:
             self.border_color = "#CCCCCC"
         if self.align not in self._ALIGN_VALUES:
             self.align = "left"
+        self.background_color = _optional_hex(self.background_color)
 
     @staticmethod
     def _non_negative(value: Any, fallback: int) -> int:

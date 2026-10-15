@@ -114,6 +114,31 @@ class TestAddRecordingArchivalDefaults:
 
 
 # ---------------------------------------------------------------------------
+# AddRecordingDialog — Trade Status combo (L15.9.5)
+# ---------------------------------------------------------------------------
+
+class TestTradeStatusCombo:
+    def test_editable_combo_saves_nft_and_none(self, qt_app: BootlegCatalogApplication) -> None:
+        settings = _make_settings(trade_status_suggestions=["NFT", "NFTF"])
+        dlg = AddRecordingDialog(_make_recording(), settings)
+
+        assert dlg.trade_status_edit.isEditable()
+        assert dlg.trade_status_edit.findText("NFT") >= 0
+        assert dlg.trade_status_edit.findText("NFTF") >= 0
+
+        dlg.trade_status_edit.setEditText("NFT")
+        dlg._on_save()
+        assert dlg.result_recording is not None
+        assert dlg.result_recording.trade_status == "NFT"
+
+        # Blank stays unset (None), like the other archival fields.
+        blank_dlg = AddRecordingDialog(_make_recording(), settings)
+        blank_dlg._on_save()
+        assert blank_dlg.result_recording is not None
+        assert blank_dlg.result_recording.trade_status is None
+
+
+# ---------------------------------------------------------------------------
 # AddRecordingDialog — probe error
 # ---------------------------------------------------------------------------
 

@@ -13,7 +13,10 @@ reads ``result_screenshot_paths`` / ``result_manual_paths`` /
 ``Generate Screenshots…`` runs FFmpeg on a worker thread to extract
 frames beside the source video; generated paths join the internal
 list as Auto rows (never ``manual_paths``) and leave the dialog
-through the same accessors.
+through the same accessors.  Two-part recordings generate from BOTH
+parts — each part's timestamps planned against its own freshly
+probed duration, not the aggregate — and only in the random mode:
+manual timestamps are refused with an explanatory dialog.
 
 Manual screenshots are embedded into the ``.bootleg`` on save; auto
 sidecar screenshots stay referenced (see session_store).
@@ -46,7 +49,7 @@ from PySide6.QtWidgets import (
 from bootleg_catalog.core.multi_part import distribute_screenshot_counts
 from bootleg_catalog.core.screenshot_generator import (
     ScreenshotPlan,
-    auto_timestamps,
+    random_timestamps,
 )
 from bootleg_catalog.core.settings_service import load_settings
 from bootleg_catalog.models.export_recording import ExportRecording
@@ -91,11 +94,12 @@ class ScreenshotManagerDialog(QDialog):
         self._paths = list(recording.screenshot_paths)
         self._manual = set(recording.manual_paths)
         self._row_widgets: list[QWidget] = []
-        # Generation state: source/duration are read once (never the
-        # live recording), and the thread/worker refs mirror the
+        # Generation state: source/duration/parts are read once (never
+        # the live recording), and the thread/worker refs mirror the
         # ExportPreviewWindow probe pair.
         self._source_path = recording.source_path
         self._duration = recording.duration
+        self._parts = tuple(recording.parts)
         self._generating = False
         self._screenshot_thread: QThread | None = None
         self._screenshot_worker: ScreenshotWorker | None = None
@@ -357,7 +361,12 @@ class ScreenshotManagerDialog(QDialog):
     # -- FFmpeg generation ---------------------------------------------------
 
     def _on_generate_screenshots(self) -> None:
-        """Plan a generation run and start it on a worker thread."""
+        """Plan a generation run and start it on a worker thread.
+
+        Two-part recordings support only the random mode: manual
+        timestamps have no meaning across two files, so that
+        combination is refused with an explanatory dialog.
+        """
         if not self._duration:
             QMessageBox.information(
                 self,
@@ -370,35 +379,94 @@ class ScreenshotManagerDialog(QDialog):
         if modal.exec() != QDialog.DialogCode.Accepted:
             return
 
-        if modal.use_auto_timestamps:
+        settings = load_settings()
+        ffmpeg = settings.ffmpeg_path or "ffmpeg"
+
+        if len(self._parts) == 2:
+            if not modal.use_random_timestamps:
+                QMessageBox.information(
+                    self,
+                    "Generate Screenshots",
+                    "Manual timestamps are not supported for multi-part "
+                    "recordings. Use Auto, then adjust the resulting "
+                    "images in the Screenshot Manager.",
+                )
+                return
+            self._start_multipart_generation(
+                modal.frame_count, modal.overwrite, ffmpeg,
+                settings.ffprobe_path or None,
+            )
+            return
+
+        if modal.use_random_timestamps:
             plan = ScreenshotPlan(
-                auto_timestamps(self._duration, modal.frame_count),
+                random_timestamps(self._duration, modal.frame_count),
             )
         else:
             plan = ScreenshotPlan(tuple(sorted(modal.manual_timestamps)))
+        self._start_generation(plan, ffmpeg, modal.overwrite)
 
-        self._start_generation(plan, load_settings().ffmpeg_path or "ffmpeg",
-                               modal.overwrite)
+    def _start_multipart_generation(
+        self,
+        total: int,
+        overwrite: bool,
+        ffmpeg_path: str,
+        ffprobe_path: str | None,
+    ) -> None:
+        """Start a random-mode run across both parts of the recording.
+
+        The read-once generation state is snapshotted into a fresh
+        ExportRecording, so the worker never touches the live one; the
+        worker probes each part's duration on its own thread and plans
+        that part's timestamps against it.
+        """
+        snapshot = ExportRecording(
+            source_path=self._source_path,
+            duration=self._duration,
+            parts=self._parts,
+        )
+        self._start_generation(
+            None,
+            ffmpeg_path,
+            overwrite,
+            recording=snapshot,
+            total=total,
+            ffprobe_path=ffprobe_path,
+        )
 
     def _start_generation(
-        self, plan: ScreenshotPlan, ffmpeg_path: str, overwrite: bool,
+        self,
+        plan: ScreenshotPlan | None,
+        ffmpeg_path: str,
+        overwrite: bool,
+        *,
+        recording: ExportRecording | None = None,
+        total: int = 0,
+        ffprobe_path: str | None = None,
     ) -> None:
         """Wire a ScreenshotWorker onto a fresh QThread and start it.
 
-        The wiring mirrors ProbeWorker in ExportPreviewWindow:
-        ``started`` → ``run``, ``finished``/``failed`` → ``quit`` and
-        ``worker.deleteLater``, ``thread.finished`` →
-        ``thread.deleteLater``.  This dialog only owns the refs, never
-        the thread's event loop.
+        Plan mode (``plan``) extracts a pre-built plan from the single
+        source file; recording mode (``recording`` + ``total``) hands
+        the whole 1-2 part recording over, and the worker probes and
+        plans per part on its own thread.  The wiring mirrors
+        ProbeWorker in ExportPreviewWindow: ``started`` → ``run``,
+        ``finished``/``failed`` → ``quit`` and ``worker.deleteLater``,
+        ``thread.finished`` → ``thread.deleteLater``.  This dialog
+        only owns the refs, never the thread's event loop.
         """
         self._set_generating(True)
-        total = len(plan.timestamps)
+        if recording is None:
+            total = len(plan.timestamps) if plan is not None else 0
         self._status_label.setText(f"Generating 0 of {total}\u2026")
         self._status_label.show()
 
         thread = QThread()
         worker = ScreenshotWorker(
             self._source_path, plan, ffmpeg_path, overwrite,
+            recording=recording,
+            total=total,
+            ffprobe_path=ffprobe_path,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -452,13 +520,14 @@ class ScreenshotManagerDialog(QDialog):
 class GenerateScreenshotsDialog(QDialog):
     """Choose how many frames to extract and at which timestamps.
 
-    ``How many`` (1–20, default 5) drives Auto mode, which spaces the
-    frames across the runtime via
-    :func:`~bootleg_catalog.core.screenshot_generator.auto_timestamps`.
-    Manual mode lists one timestamp spin box per row (0.0 … duration,
-    step 0.5), added with ``+ Add`` (up to 20 rows) and removed with a
-    per-row ``− Remove``.  The caller reads the property accessors
-    after ``Accepted``; nothing is executed here.
+    ``How many`` (1–20, default 5) drives Random mode, which draws one
+    timestamp per segment of the 5–95% window via
+    :func:`~bootleg_catalog.core.screenshot_generator.random_timestamps`,
+    so every run differs.  Manual mode lists one timestamp spin box
+    per row (0.0 … duration, step 0.5), added with ``+ Add`` (up to
+    20 rows) and removed with a per-row ``− Remove``.  The caller
+    reads the property accessors after ``Accepted``; nothing is
+    executed here.
     """
 
     def __init__(
@@ -484,8 +553,8 @@ class GenerateScreenshotsDialog(QDialog):
         count_row.addStretch()
         layout.addLayout(count_row)
 
-        self._auto_radio = QRadioButton("Auto timestamps", self)
-        self._auto_radio.setObjectName("autoTimestampsRadio")
+        self._auto_radio = QRadioButton("Random timestamps", self)
+        self._auto_radio.setObjectName("randomTimestampsRadio")
         self._auto_radio.setChecked(True)
         self._auto_radio.toggled.connect(self._on_mode_changed)
         layout.addWidget(self._auto_radio)
@@ -520,19 +589,19 @@ class GenerateScreenshotsDialog(QDialog):
         self._buttons.rejected.connect(self.reject)
         layout.addWidget(self._buttons)
 
-        # Auto is the default mode: the manual rows start hidden.
+        # Random is the default mode: the manual rows start hidden.
         self._on_mode_changed(self._auto_radio.isChecked())
 
     # -- Result accessors (read by ScreenshotManagerDialog on accept) -------
 
     @property
     def frame_count(self) -> int:
-        """The requested frame count (Auto mode)."""
+        """The requested frame count (Random mode)."""
         return self._count_spin.value()
 
     @property
-    def use_auto_timestamps(self) -> bool:
-        """True when the Auto radio is selected."""
+    def use_random_timestamps(self) -> bool:
+        """True when the Random radio is selected."""
         return self._auto_radio.isChecked()
 
     @property

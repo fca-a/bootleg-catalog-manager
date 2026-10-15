@@ -32,6 +32,11 @@ The suggestions offered when you catalog a recording follow the lists as
 you edited them, so the catalog stays consistent across sessions without
 typing the same labels repeatedly.
 
+Trade Status is a fourth field with suggestions. It ships with two
+defaults, **NFT** (Not For Trade) and **NFTF** (Not For Trade Forever),
+and accepts any typed value. The Trade Status list is not yet editable
+in the settings dialog; that is planned for a future release.
+
 ## Related pages
 
 - [Installation](installation.md) — installing FFmpeg and FFprobe

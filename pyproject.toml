@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bootleg-catalog-manager"
-version = "1.0.0"
+version = "1.1.0"
 description = "Local-first desktop application for cataloging live recordings and building custom PDF/XLSX exports."
 readme = "README.md"
 license = { text = "MIT" }

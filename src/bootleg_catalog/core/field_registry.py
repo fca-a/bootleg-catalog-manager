@@ -250,6 +250,10 @@ ARCHIVAL_FIELDS: dict[str, ArchivalFieldSpec] = {
         name="Description", display_name="Description",
         resolver=lambda r: r.description,
     ),
+    "Trade Status": ArchivalFieldSpec(
+        name="Trade Status", display_name="Trade Status",
+        resolver=lambda r: r.trade_status,
+    ),
 }
 
 # Suggestion fields — archival + configurable suggestion list.

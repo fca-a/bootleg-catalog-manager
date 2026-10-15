@@ -609,7 +609,7 @@ class TestDefaultLayout:
         assert layout.name == "Default"
         assert len(layout.show_header) > 0
         assert len(layout.recording_body) > 0
-        assert layout.separator == "\u2500"
+        assert layout.separator == "-"  # Bug F.2: ASCII default, not U+2500
         assert layout.page_config == PageConfig()
         assert layout.screenshot_config == ScreenshotConfig()
 

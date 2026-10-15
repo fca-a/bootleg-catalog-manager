@@ -14,6 +14,8 @@ media files.
   or run from source on Linux and macOS; FFmpeg and FFprobe setup.
 - [First steps](first-steps.md) — create a session, add recordings, choose a
   layout, and run your first export.
+- [Audio recordings](audio.md) — add a single audio file or an album
+  folder as one entry; screenshots do not apply to audio.
 - [Layouts](layouts.md) — write layout templates with field markers and
   inline formatting.
 - [Screenshots](screenshots.md) — generate screenshots with FFmpeg, pick up

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from bootleg_catalog.models.export_recording import ExportRecording
@@ -142,6 +144,35 @@ class TestExportRecordingFields:
         assert len(rec.screenshot_paths) == 2
         assert rec.screenshot_paths[0] == "/test.screenshot.01.jpg"
         assert rec.screenshot_paths[1] == "/test.screenshot.02.jpg"
+
+
+class TestAudioRecordingFields:
+    """is_audio + tracks: audio entries, and the video-only guard."""
+
+    def test_audio_constructs_and_video_tracks_raise(self) -> None:
+        audio = ExportRecording(
+            source_path="/albums/live",
+            is_audio=True,
+            tracks=("/a.mp3",),
+        )
+        assert audio.is_audio is True
+        assert audio.tracks == ("/a.mp3",)
+
+        # Video entries must never carry tracks.
+        with pytest.raises(ValueError, match="is_audio"):
+            ExportRecording(source_path="/x.mkv", tracks=("/a.mp3",))
+
+    def test_replace_preserves_audio_fields(self) -> None:
+        audio = ExportRecording(
+            source_path="/albums/live",
+            is_audio=True,
+            tracks=("/albums/live/01.mp3", "/albums/live/02.mp3"),
+            title="Live",
+        )
+        edited = replace(audio, title="Edited")
+        assert edited.is_audio is True
+        assert edited.tracks == audio.tracks
+        assert edited.title == "Edited"
 
 
 class TestExportRecordingIndependence:

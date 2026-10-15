@@ -9,8 +9,10 @@ Completely isolated from the catalog, repository, SQLite, and Recording.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
+from bootleg_catalog.core.audio_scanner import AudioScanError, scan_audio_folder
 from bootleg_catalog.core.export_session import ExportSession, ExportSessionError
 from bootleg_catalog.core.layout_resolver import LayoutResolver
 from bootleg_catalog.core.layout_service import screenshots_for_recording
@@ -172,6 +174,83 @@ class ExportSessionService:
             audio_bitrate=audio_bitrate,
             screenshot_paths=screenshot_paths,
             probe_error=probe_error,
+        )
+
+    def probe_audio_recording_from_path(self, path: str | Path) -> ExportRecording:
+        """Probe an audio file or album folder WITHOUT adding it.
+
+        Same contract as :meth:`probe_recording_from_path`: the caller
+        decides whether to commit the result (the add dialog does).
+
+        A FILE becomes a single-track entry — ``tracks == (source,)``
+        and the technical fields are exactly a video single-file
+        probe's (the video probe's fields simply come back ``None`` for
+        audio).  Sidecar screenshots are dropped: audio entries never
+        show images, and ``[Screenshot:N]`` resolves empty for them
+        (see :class:`~bootleg_catalog.core.field_resolver.FieldResolver`).
+
+        A FOLDER is scanned with :func:`scan_audio_folder` and every
+        track probed in sorted order: ``duration`` is the sum of the
+        known track durations, the first track's audio parameters
+        represent the album, ``file_size`` the total, and
+        ``extension`` is ``""`` (a folder has no file extension).
+
+        Raises
+        ------
+        ExportSessionServiceError
+            If the path is neither an existing file, nor a readable
+            folder containing audio files — scan failures are re-raised
+            under the service's own error type.
+        """
+        source = Path(path)
+        if source.is_dir():
+            try:
+                tracks = scan_audio_folder(source)
+            except AudioScanError as exc:
+                raise ExportSessionServiceError(str(exc)) from exc
+            return self._probe_audio_folder(source, tracks)
+        if not source.is_file():
+            raise ExportSessionServiceError(
+                f"The file does not exist:\n{source}"
+            )
+
+        # Reuse the video single-file probe so both share one set of
+        # technical fields, then flip the audio flags and drop the
+        # sidecar screenshots it discovered (irrelevant for audio).
+        base = self.probe_recording_from_path(source)
+        return replace(
+            base,
+            is_audio=True,
+            tracks=(base.source_path,),
+            screenshot_paths=[],
+        )
+
+    def _probe_audio_folder(
+        self, folder: Path, tracks: tuple[str, ...]
+    ) -> ExportRecording:
+        """Aggregate one probe per track into a single album recording."""
+        probed = [self.probe_recording_from_path(track) for track in tracks]
+        first = probed[0]
+        durations = [r.duration for r in probed if r.duration is not None]
+        # A failing track does not abort the album: keep the first
+        # error for display and sum whatever durations are known.
+        first_error = next(
+            (r.probe_error for r in probed if r.probe_error), None
+        )
+        return ExportRecording(
+            source_path=str(folder.resolve()),
+            is_audio=True,
+            tracks=tracks,
+            extension="",  # a folder has no file extension
+            file_size=sum(r.file_size or 0 for r in probed),
+            duration=sum(durations) if durations else None,
+            # Representative album values: the first track's probe.
+            container_format=first.container_format,
+            audio_codec=first.audio_codec,
+            audio_channels=first.audio_channels,
+            audio_sample_rate=first.audio_sample_rate,
+            audio_bitrate=first.audio_bitrate,
+            probe_error=first_error,
         )
 
     def add_recording(self, recording: ExportRecording) -> None:

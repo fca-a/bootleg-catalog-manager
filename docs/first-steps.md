@@ -38,6 +38,10 @@ in the session are skipped when you scan the same folder again.
 Recordings can also be imported as a single entry from a disc rip folder;
 see [Rips and multi-part recordings](rips.md).
 
+Audio recordings are added the same way, with
+`+ Add Audio Recording…` — either a single audio file or a folder of
+tracks as one album entry; see [Audio recordings](audio.md).
+
 ## Pick a layout
 
 Every export is driven by a layout template. A default layout is provided;

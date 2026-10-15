@@ -13,6 +13,7 @@ from bootleg_catalog.app.application import BootlegCatalogApplication
 from bootleg_catalog.core.settings_service import (
     DEFAULT_QUALITY_SUGGESTIONS,
     DEFAULT_SOURCE_SUGGESTIONS,
+    DEFAULT_TRADE_STATUS_SUGGESTIONS,
     DEFAULT_TYPE_SUGGESTIONS,
     AppSettings,
     _settings_path,
@@ -310,6 +311,32 @@ class TestQualitySuggestions:
     def test_equality_not_app_settings(self) -> None:
         s = AppSettings()
         assert s != "not a settings"
+
+
+# ---------------------------------------------------------------------------
+# Trade Status suggestion list
+# ---------------------------------------------------------------------------
+
+
+class TestTradeStatusSuggestions:
+    def test_defaults_and_fallbacks(self) -> None:
+        s = AppSettings()
+        assert s.trade_status_suggestions == ["NFT", "NFTF"]
+
+        d = s.to_dict()
+        assert d["suggestion_lists"]["trade_status"] == ["NFT", "NFTF"]
+
+        # Missing key → defaults, same as the other three lists.
+        loaded = AppSettings.from_dict({"suggestion_lists": {}})
+        assert loaded.trade_status_suggestions == list(DEFAULT_TRADE_STATUS_SUGGESTIONS)
+
+        # Empty list [] is valid — free text only.
+        empty = AppSettings.from_dict({"suggestion_lists": {"trade_status": []}})
+        assert empty.trade_status_suggestions == []
+
+        # Non-list value → defaults.
+        bad = AppSettings.from_dict({"suggestion_lists": {"trade_status": "oops"}})
+        assert bad.trade_status_suggestions == list(DEFAULT_TRADE_STATUS_SUGGESTIONS)
 
 
 # ---------------------------------------------------------------------------

@@ -97,6 +97,13 @@ class FieldResolver:
             # Inline [Screenshot:N] block: the count passes through
             # untouched.  No file is loaded and no registry lookup
             # happens, so it can never produce an error.
+            if recording.is_audio:
+                # Audio entries have no video frame to capture (an
+                # album folder has none at all), so the token must draw
+                # nothing: kind stays "text" (the default) — no
+                # screenshot directive — with an empty text and a zero
+                # count for any renderer that reads content.
+                return ResolvedElement(text="", content="0", style=None), None
             return ResolvedElement(
                 kind="screenshot",
                 text="",

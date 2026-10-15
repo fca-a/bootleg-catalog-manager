@@ -349,3 +349,34 @@ class TestStylePreservation:
         resolved, _ = resolver.resolve_element(elem, rec)
         assert resolved.style is style
         assert resolved.text == "---"
+
+
+# ---------------------------------------------------------------------------
+# Screenshot token (audio suppression)
+# ---------------------------------------------------------------------------
+
+class TestScreenshotElement:
+    """[Screenshot:N] passes through for video, vanishes for audio."""
+
+    def test_audio_suppresses_video_passes_through(
+        self, resolver: FieldResolver,
+    ) -> None:
+        elem = LayoutElement(kind="screenshot", content="3")
+
+        audio = ExportRecording(
+            source_path="/albums/live",
+            is_audio=True,
+            tracks=("/albums/live/01.mp3",),
+        )
+        resolved, err = resolver.resolve_element(elem, audio)
+        assert err is None
+        assert resolved.text == ""
+        assert resolved.content == "0"
+        # No screenshot directive → every renderer draws nothing.
+        assert resolved.kind != "screenshot"
+
+        video = ExportRecording(source_path="/shows/munich.mkv")
+        resolved_video, err_video = resolver.resolve_element(elem, video)
+        assert err_video is None
+        assert resolved_video.kind == "screenshot"
+        assert resolved_video.content == "3"

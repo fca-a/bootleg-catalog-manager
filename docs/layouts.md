@@ -11,7 +11,7 @@ There are two marker families, and they carry different meaning:
 - `{FieldName}` for technical fields, for example `{Duration}`,
   `{Resolution}`, `{Video Codec}`
 - `[FieldName]` for archival fields, for example `[Show]`, `[Venue]`,
-  `[Year]`
+  `[Year]`, `[Trade Status]`
 
 Technical fields hold what FFprobe read from the file; archival fields hold
 what you cataloged by hand.
@@ -39,6 +39,35 @@ settings in the page setup; see [Screenshots](screenshots.md).
 The page setup controls the paper size (A4, Letter, A3), orientation
 (portrait or landscape), and custom margins. Header and footer bands can
 carry text and optional logo images.
+
+## Background colors
+
+The page setup dialog also has a Backgrounds group with five colors, one
+per area of the page. Any of the five can be left unset, which keeps the
+export's default — a white page with no fills:
+
+- **Page background** — the whole page, behind everything
+- **Header background** — the band across the top margin, behind the
+  header text
+- **Footer background** — the band across the bottom margin, behind the
+  footer text
+- **Body background** — the content column between the two bands
+- **Screenshot background** — the fill behind each image placed by
+  `[Screenshot:N]`
+
+Each row shows its current color as a swatch; clicking it opens a color
+picker, and clearing it returns the area to unset. The colors are part of
+the layout, so they travel with the session file, and the export preview
+shows them before the PDF is written.
+
+## Trade Status
+
+`[Trade Status]` is a free-text archival field for whether the recording
+can be traded. It ships with two default suggestions: **NFT** (Not For
+Trade) and **NFTF** (Not For Trade Forever). Any value can be typed — the
+suggestions are a starting point, not a fixed list. The suggestion list
+is not yet editable in the settings dialog; that is planned for a future
+release.
 
 ## Worked example
 

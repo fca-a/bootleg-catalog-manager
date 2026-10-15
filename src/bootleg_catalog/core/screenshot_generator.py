@@ -13,16 +13,22 @@ Public API
 ----------
 - :class:`ScreenshotError`
 - :class:`ScreenshotPlan`
-- :func:`auto_timestamps`
+- :func:`random_timestamps`
 - :func:`generate_screenshots`
+- :func:`generate_screenshots_for_recording`
 """
 
 from __future__ import annotations
 
+import random
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from bootleg_catalog.core.multi_part import distribute_screenshot_counts
+from bootleg_catalog.models.export_recording import ExportRecording
+from bootleg_catalog.utils.ffmpeg import FFprobeError, probe
 
 # One frame extraction gets this long before it is abandoned; the value
 # mirrors the generous side of utils.ffmpeg's per-probe timeout (a
@@ -46,16 +52,17 @@ def _output_path(video_path: Path, index: int) -> Path:
     return video_path.with_name(f"{video_path.stem}.screenshot.{index:02d}.jpg")
 
 
-def auto_timestamps(duration_seconds: float, count: int) -> tuple[float, ...]:
-    """Distribute *count* timestamps across *duration_seconds*.
+def random_timestamps(duration_seconds: float, count: int) -> tuple[float, ...]:
+    """Pick *count* random timestamps across *duration_seconds*.
 
     The first and last 5% of the runtime are skipped so no frame lands
-    in a fade-in or fade-out.  The points sit at the centres of
-    *count* equal slices of the remaining 90% window, which makes them
-    structurally strictly increasing: every point adds the same
-    strictly positive step, so values can never tie.  Nothing is
-    rounded — full precision is what preserves that guarantee, and
-    ffmpeg parses any float for ``-ss``.
+    in a fade-in or fade-out.  That 90% window is divided into *count*
+    equal segments, and each segment contributes exactly one timestamp
+    drawn uniformly inside it.  The spread is therefore guaranteed —
+    one pick per segment — while every run yields different values, so
+    re-running generation can capture moments the previous run missed.
+    Nothing is rounded; full precision gives ffmpeg any float for
+    ``-ss``.
 
     Raises :class:`ScreenshotError` when *duration_seconds* is not
     positive, and ``ValueError`` when *count* is below 1.
@@ -67,9 +74,15 @@ def auto_timestamps(duration_seconds: float, count: int) -> tuple[float, ...]:
     if count < 1:
         raise ValueError("count must be at least 1")
 
-    start = duration_seconds * 0.05
-    step = (duration_seconds * 0.90) / count
-    return tuple(start + (index + 0.5) * step for index in range(count))
+    window_start = duration_seconds * 0.05
+    segment = (duration_seconds * 0.90) / count
+    return tuple(
+        random.uniform(
+            window_start + index * segment,
+            window_start + (index + 1) * segment,
+        )
+        for index in range(count)
+    )
 
 
 def generate_screenshots(
@@ -153,4 +166,76 @@ def generate_screenshots(
         if progress_cb is not None:
             progress_cb(index + 1, total)
 
+    return written
+
+
+def generate_screenshots_for_recording(
+    recording: ExportRecording,
+    total: int,
+    ffmpeg_path: str = "ffmpeg",
+    *,
+    ffprobe_path: str | Path | None = None,
+    overwrite: bool = False,
+    progress_cb: Callable[[int, int], None] | None = None,
+) -> list[str]:
+    """Random-mode auto generation for one recording (1 or 2 parts).
+
+    Single-part recordings behave exactly as before: *total* random
+    timestamps across ``recording.duration``, every frame extracted
+    from ``recording.parts[0]`` (equal to ``source_path``), the
+    sidecars beside that file, and no probing.
+
+    Two-part recordings split *total* with
+    :func:`~bootleg_catalog.core.multi_part.distribute_screenshot_counts`
+    (the first part gets the larger half), re-probe each part once —
+    the durations are cached for the duration of this call — and plan
+    each part's timestamps against that part's OWN duration instead of
+    the aggregate, so no frame is placed by the wrong file's runtime.
+    Each part writes its own ``<stem>.screenshot.NN.jpg`` sidecars
+    beside its own file, numbering restarting at 01 per part.
+
+    *progress_cb*, when given, reports one overall ``current`` of
+    *total* across both parts.  Raises :class:`ScreenshotError` when a
+    part cannot be probed or its duration is unavailable.
+    """
+    parts = recording.parts
+    if len(parts) == 1:
+        plan = ScreenshotPlan(
+            random_timestamps(recording.duration or 0.0, total),
+        )
+        return generate_screenshots(
+            parts[0], plan, ffmpeg_path,
+            overwrite=overwrite, progress_cb=progress_cb,
+        )
+
+    counts = distribute_screenshot_counts(total, 2)
+    durations: dict[str, float] = {}
+    written: list[str] = []
+    grand_total = sum(counts)
+    completed = 0
+    for part, count in zip(parts, counts):
+        if part not in durations:
+            try:
+                probed = probe(part, ffprobe_path=ffprobe_path)
+            except FFprobeError as exc:
+                raise ScreenshotError(
+                    f"Could not read the duration of {Path(part).name}: {exc}"
+                ) from exc
+            durations[part] = probed.duration or 0.0
+        plan = ScreenshotPlan(random_timestamps(durations[part], count))
+        done_before = completed
+
+        def _part_progress(
+            current: int, _part_total: int, done: int = done_before,
+        ) -> None:
+            if progress_cb is not None:
+                progress_cb(done + current, grand_total)
+
+        written.extend(
+            generate_screenshots(
+                part, plan, ffmpeg_path,
+                overwrite=overwrite, progress_cb=_part_progress,
+            )
+        )
+        completed += count
     return written

@@ -40,7 +40,7 @@ from bootleg_catalog.ui.dialogs.layout_designer_dialog import (
 from bootleg_catalog.ui.widgets.export_preview_widget import PreviewWidget
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QFontDatabase, QTextCursor
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QTextCursor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFontComboBox,
+    QGroupBox,
     QGraphicsDropShadowEffect,
     QLabel,
     QPushButton,
@@ -735,6 +736,42 @@ class TestPageSetupScreenshots:
         assert dialog.result_screenshot_config.spacing_px == 17
 
 
+class TestPageSetupBackgrounds:
+    """PageSetupDialog's Backgrounds group: five swatch buttons."""
+
+    def test_backgrounds_group_five_rows_and_accept(self, qt_app) -> None:
+        """Five swatch buttons exist; picked colours land on the right
+        config — the page four on PageConfig, the screenshot one on
+        ScreenshotConfig."""
+        dialog = PageSetupDialog(PageConfig())
+
+        assert dialog.findChild(QGroupBox, "backgroundsGroupBox") is not None
+        for name in (
+            "pageBackgroundButton",
+            "headerBackgroundButton",
+            "footerBackgroundButton",
+            "bodyBackgroundButton",
+            "screenshotBackgroundButton",
+        ):
+            assert dialog.findChild(QPushButton, name) is not None
+
+        with patch(
+            "bootleg_catalog.ui.dialogs.layout_designer_dialog."
+            "QColorDialog.getColor",
+            side_effect=[QColor("#112233"), QColor("#445566")],
+        ):
+            dialog.findChild(QPushButton, "pageBackgroundButton").click()
+            dialog.findChild(QPushButton, "screenshotBackgroundButton").click()
+
+        dialog._on_accept()
+
+        assert dialog.result_page_config is not None
+        assert dialog.result_page_config.page_background_color == "#112233"
+        assert dialog.result_page_config.header_background_color is None
+        assert dialog.result_screenshot_config is not None
+        assert dialog.result_screenshot_config.background_color == "#445566"
+
+
 # ---------------------------------------------------------------------------
 # Inline formatting toolbar (L15.8.6a)
 # ---------------------------------------------------------------------------
@@ -1135,3 +1172,31 @@ class TestPageSetupFonts:
         assert not warning.isHidden()
         assert '"ThisFontIsNotInstalled" is not installed here' in warning.text()
         assert "will fall back to Helvetica" in warning.text()
+
+
+class TestLayoutTokensPalette:
+    """Bug B: the palette offers the literal [Screenshot:N] token."""
+
+    def test_palette_has_layout_tokens_group(self, qt_app) -> None:
+        """A 'Layout tokens' group holds the 'Screenshot count' entry."""
+        dlg = LayoutDesignerDialog(_make_layout())
+
+        titles = [group.title() for group in dlg.findChildren(QGroupBox)]
+        assert "Layout tokens" in titles
+        items = [
+            dlg._token_list.item(i).text()
+            for i in range(dlg._token_list.count())
+        ]
+        assert "Screenshot count" in items
+
+    def test_inserting_the_token_puts_screenshot_three(
+        self, qt_app,
+    ) -> None:
+        """Double-clicking the entry inserts exactly [Screenshot:3]."""
+        dlg = LayoutDesignerDialog(_make_layout())
+        dlg._show_header_edit.clear()
+        dlg._last_focused = dlg._show_header_edit
+
+        dlg._token_list.itemDoubleClicked.emit(dlg._token_list.item(0))
+
+        assert dlg._show_header_edit.toPlainText() == "[Screenshot:3]"
